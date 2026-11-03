@@ -26,6 +26,12 @@ build:
 test:
 	go test -race ./...
 
+# Runs the integration tests against a throwaway Azurite container; needs
+# docker.
+.PHONY: test-integration
+test-integration:
+	./hack/test-azurite.sh
+
 .PHONY: fmt
 fmt:
 	$(GOFMT) -w .
