@@ -41,3 +41,16 @@ jobs:
       run: make verify
     - name: test
       run: make test
+  run-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: 'go.mod'
+    # runs Azurite in docker, which ubuntu-latest provides
+    - name: test against Azurite
+      run: make test-integration
