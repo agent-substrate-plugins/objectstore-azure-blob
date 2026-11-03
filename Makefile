@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ko pushes to KO_DOCKER_REPO. --base-import-paths names the image
+# azure-blob-objectstore-plugin, without a hash suffix.
+KO       ?= go run github.com/google/ko@v0.19.1
+KO_FLAGS ?= --base-import-paths
+
 # The toolchain's own gofmt, not whichever one is first on PATH.
 GOFMT := $(shell go env GOROOT)/bin/gofmt
 
@@ -42,3 +47,9 @@ verify:
 	go vet ./...
 	go vet -tags=integration ./...
 	go mod tidy -diff
+
+# Builds and pushes the image, printing its reference with the digest to set
+# in the kustomize components.
+.PHONY: build-image
+build-image:
+	$(KO) build $(KO_FLAGS) ./cmd/azure-blob-objectstore-plugin
