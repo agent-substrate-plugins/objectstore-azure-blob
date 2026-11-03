@@ -13,5 +13,5 @@
 // limitations under the License.
 
 // Package azureblob is the root of the Azure Blob object-store plugin
-// module.
+// module. The plugin binary is cmd/azure-blob-objectstore-plugin.
 package azureblob

@@ -27,3 +27,6 @@ The test uploads and restores a 320 MiB file with distinct per-block patterns,
 retries a partial block upload, verifies corrupt data is rejected, exercises
 concurrent uploads, and checks both control RPCs. Another uploads and copies
 blocks larger than 32 MiB, which are streamed rather than buffered.
+
+The import-boundary test rejects imports of substrate packages outside `api/`
+and `pkg/`.
