@@ -9,6 +9,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.0
 	go.ate.dev/substrate v0.6.1-0.20261028215204-893a45817bee
+	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.83.2
 	k8s.io/apimachinery v0.37.0
 	sigs.k8s.io/yaml v1.6.0
@@ -27,7 +28,6 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
