@@ -41,6 +41,8 @@ import (
 // Azure implements Store with one Azure Blob container.
 type Azure struct {
 	container *container.Client
+	// name is the container's name, for errors.
+	name string
 }
 
 // NewAzure returns a Store for each of containers in the account served at
@@ -84,7 +86,7 @@ func clientOptions(endpoint *url.URL, base http.RoundTripper, retry policy.Retry
 }
 
 func newAzure(client *service.Client, containerName string) *Azure {
-	return &Azure{container: client.NewContainerClient(containerName)}
+	return &Azure{container: client.NewContainerClient(containerName), name: containerName}
 }
 
 func parseConfiguration(accountURL string, containers []string) (*url.URL, error) {
@@ -149,13 +151,13 @@ func (a *Azure) StageBlock(ctx context.Context, name, blockID string, body io.Re
 	_, err := a.blob(name).StageBlock(ctx, blockID, streaming.NopCloser(body), &blockblob.StageBlockOptions{
 		TransactionalValidation: blob.TransferValidationTypeMD5(md5),
 	})
-	return mapError(err)
+	return mapError(err, a.name, name)
 }
 
 // CommitBlockList atomically replaces a blob with the staged block list.
 func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error {
 	_, err := a.blob(name).CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{Metadata: metadata})
-	return mapError(err)
+	return mapError(err, a.name, name)
 }
 
 // Download opens a blob and returns the integrity metadata stored with it.
@@ -164,14 +166,14 @@ func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []str
 func (a *Azure) Download(ctx context.Context, name string) (Download, error) {
 	resp, err := a.blob(name).DownloadStream(ctx, nil)
 	if err != nil {
-		return Download{}, mapError(err)
+		return Download{}, mapError(err, a.name, name)
 	}
 	size := int64(-1)
 	if resp.ContentLength != nil {
 		size = *resp.ContentLength
 	}
 	return Download{
-		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
+		Body:     mappedBody{ReadCloser: resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3}), container: a.name, blob: name},
 		Size:     size,
 		Metadata: resp.Metadata,
 	}, nil
@@ -186,9 +188,9 @@ func (a *Azure) DownloadRange(ctx context.Context, name string, offset, count in
 	}
 	resp, err := a.blob(name).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: offset, Count: count}})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, mapError(err, a.name, name)
 	}
-	return mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})}, nil
+	return mappedBody{ReadCloser: resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3}), container: a.name, blob: name}, nil
 }
 
 // List returns every blob name under prefix.
@@ -198,7 +200,7 @@ func (a *Azure) List(ctx context.Context, prefix string) ([]string, error) {
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, mapError(err)
+			return nil, mapError(err, a.name, "")
 		}
 		for _, item := range page.Segment.BlobItems {
 			if item.Name != nil {
@@ -212,7 +214,7 @@ func (a *Azure) List(ctx context.Context, prefix string) ([]string, error) {
 // Delete removes one blob. An absent blob is already deleted.
 func (a *Azure) Delete(ctx context.Context, name string) error {
 	_, err := a.blob(name).Delete(ctx, nil)
-	err = mapError(err)
+	err = mapError(err, a.name, name)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -222,6 +224,7 @@ func (a *Azure) Delete(ctx context.Context, name string) error {
 // mappedBody maps errors from a download body the same way as request errors.
 type mappedBody struct {
 	io.ReadCloser
+	container, blob string
 }
 
 func (b mappedBody) Read(p []byte) (int, error) {
@@ -229,10 +232,12 @@ func (b mappedBody) Read(p []byte) (int, error) {
 	if err == nil || err == io.EOF {
 		return n, err
 	}
-	return n, mapError(err)
+	return n, mapError(err, b.container, b.blob)
 }
 
-func mapError(err error) error {
+// mapError maps err from a request for blob, or for container itself if blob
+// is empty, to the store's errors.
+func mapError(err error, container, blob string) error {
 	if err == nil {
 		return nil
 	}
@@ -249,9 +254,9 @@ func mapError(err error) error {
 	}
 	switch responseErr.ErrorCode {
 	case "BlobNotFound":
-		return fmt.Errorf("%w: %s", ErrNotFound, responseErr.ErrorCode)
+		return fmt.Errorf("%w: %q in container %q", ErrNotFound, blob, container)
 	case "ContainerNotFound":
-		return fmt.Errorf("%w: configured Azure Blob container does not exist", ErrContainerNotFound)
+		return fmt.Errorf("%w: configured Azure Blob container %q does not exist", ErrContainerNotFound, container)
 	case "ConditionNotMet":
 		// A resumed download found the blob replaced since it was opened.
 		// Retrying the operation reads the new blob from the start.

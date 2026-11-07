@@ -233,8 +233,8 @@ func TestAzureStore(t *testing.T) {
 	if err := store.Delete(ctx, "prefix/file"); err != nil {
 		t.Fatalf("idempotent Delete: %v", err)
 	}
-	if _, err := store.Download(ctx, "prefix/file"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing Download = %v, want ErrNotFound", err)
+	if _, err := store.Download(ctx, "prefix/file"); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), `"prefix/file" in container "snapshots"`) {
+		t.Fatalf("missing Download = %v, want ErrNotFound naming the blob and container", err)
 	}
 }
 
@@ -313,10 +313,10 @@ func TestRedactURL(t *testing.T) {
 
 func TestMapError(t *testing.T) {
 	sentinel := errors.New("plain")
-	if got := mapError(nil); got != nil {
+	if got := mapError(nil, "snapshots", "prefix/file"); got != nil {
 		t.Fatalf("mapError(nil) = %v", got)
 	}
-	if got := mapError(sentinel); !errors.Is(got, sentinel) {
+	if got := mapError(sentinel, "snapshots", "prefix/file"); !errors.Is(got, sentinel) {
 		t.Fatalf("mapError(plain) = %v", got)
 	}
 	for _, tc := range []struct {
@@ -324,9 +324,10 @@ func TestMapError(t *testing.T) {
 		statusCode int
 		errorCode  string
 		want       error
+		message    string
 	}{
-		{name: "blob missing", statusCode: http.StatusNotFound, errorCode: "BlobNotFound", want: ErrNotFound},
-		{name: "container missing", statusCode: http.StatusNotFound, errorCode: "ContainerNotFound", want: ErrContainerNotFound},
+		{name: "blob missing", statusCode: http.StatusNotFound, errorCode: "BlobNotFound", want: ErrNotFound, message: `blob not found: "prefix/file" in container "snapshots"`},
+		{name: "container missing", statusCode: http.StatusNotFound, errorCode: "ContainerNotFound", want: ErrContainerNotFound, message: `blob container not found: configured Azure Blob container "snapshots" does not exist`},
 		{name: "authentication", statusCode: http.StatusForbidden, errorCode: "AuthenticationFailed", want: ErrPermission},
 		{name: "authorization", statusCode: http.StatusForbidden, errorCode: "AuthorizationPermissionMismatch", want: ErrPermission},
 		{name: "other forbidden", statusCode: http.StatusForbidden, errorCode: "AuthorizationServiceMismatch", want: ErrPermission},
@@ -338,13 +339,17 @@ func TestMapError(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := &azcore.ResponseError{StatusCode: tc.statusCode, ErrorCode: tc.errorCode}
-			if got := mapError(err); !errors.Is(got, tc.want) {
+			got := mapError(err, "snapshots", "prefix/file")
+			if !errors.Is(got, tc.want) {
 				t.Fatalf("mapError = %v, want %v", got, tc.want)
+			}
+			if tc.message != "" && got.Error() != tc.message {
+				t.Fatalf("mapError = %q, want %q", got, tc.message)
 			}
 		})
 	}
 	other := &azcore.ResponseError{StatusCode: http.StatusBadRequest, ErrorCode: "InvalidRequest", RawResponse: &http.Response{Request: &http.Request{URL: &url.URL{}}}}
-	if got := mapError(other); got != other {
+	if got := mapError(other, "snapshots", "prefix/file"); got != other {
 		t.Fatalf("mapError(other) = %v, want original", got)
 	}
 }
@@ -373,7 +378,7 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		{name: "deadline", err: &url.Error{Op: "Get", URL: "https://a", Err: context.DeadlineExceeded}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mapError(tc.err)
+			got := mapError(tc.err, "snapshots", "prefix/file")
 			if errors.Is(got, ErrUnavailable) != tc.transient {
 				t.Fatalf("mapError(%v) = %v, want ErrUnavailable: %v", tc.err, got, tc.transient)
 			}
@@ -383,7 +388,7 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		})
 	}
 	changed := &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed, ErrorCode: "ConditionNotMet"}
-	if got := mapError(changed); !errors.Is(got, ErrUnavailable) {
+	if got := mapError(changed, "snapshots", "prefix/file"); !errors.Is(got, ErrUnavailable) {
 		t.Fatalf("mapError(ConditionNotMet) = %v, want ErrUnavailable", got)
 	}
 }
