@@ -1,366 +1,169 @@
 # Azure Blob object-store plugin
 
-This plugin implements [Agent Substrate](https://github.com/agent-substrate/substrate)'s
-`substrate.objectstore.v1` node and control services with Azure Blob Storage,
-and its `AssetProvider` for sandbox assets. It runs in `node` mode beside
-atelet and in `control` mode beside ate-api-server. The module imports only
-substrate's public `api/` and `pkg/` packages.
-
-The plugin stores each requested snapshot file as one block blob. Uploads use
-deterministic staged block IDs and atomically replace the committed block list,
-so a retry after a partial upload is safe. Each blob carries a SHA-256 digest
-in metadata. Fetch and copy verify that digest before exposing or committing
-the destination bytes. Azure also verifies each staged block's MD5 in transit.
+An [Agent Substrate](https://github.com/agent-substrate/substrate) object-store
+plugin that keeps actor snapshots and sandbox assets in Azure Blob Storage. It
+replaces the `objectstore-plugin` sidecars next to atelet and ate-api-server
+and authenticates only with Microsoft Entra workload identity.
 
 ## Compatibility
 
-The plugin needs a substrate that serves the `substrate.objectstore.v1` proto
-package, introduced by
-[agent-substrate/substrate@48f5744](https://github.com/agent-substrate/substrate/commit/48f5744c1dde5ffa63e926f5b4d037065f109965).
-As of 2026-10-28, no substrate release includes it and the `release-0.6` branch
-does not either. Releases cut from `main` after that commit will; v0.6.x patch
-releases cut from `release-0.6` will not unless the commit is cherry-picked
-there. v0.6.0 and earlier call the old `objectstore.v1` service name, so this
-plugin answers them with `Unimplemented`. `go.mod` pins the substrate version
-the plugin is built and tested against.
+The plugin serves the `substrate.objectstore.v1` gRPC services that substrate
+v1.0.0 calls. `go.mod` pins the substrate commit the plugin is built and tested
+against; v1.0.0 contains it. Substrate v0.5.0 and v0.6.0 call `objectstore.v1`
+and get `Unimplemented`; earlier releases call no object-store plugin.
 
-## Sidecars
+## How it works
 
-Substrate's install manifests run an `objectstore-plugin` native sidecar next to
-atelet and ate-api-server, and the callers reach it over a Unix socket in a
-pod-local `emptyDir`:
+| Mode | Runs beside | Serves |
+|---|---|---|
+| `control` | ate-api-server | `ControlProvider`: copy and clean up snapshots |
+| `node` | atelet | `NodeProvider`: upload and fetch snapshots; `AssetProvider` when `--asset-containers` is set |
+| `healthcheck` | | Exits 0 if the plugin at `--socket` reports `SERVING` within `--timeout` (default `5s`) |
 
-- node socket: `/run/objectstore-plugin/node.sock`
-- control socket: `/run/objectstore-plugin/control.sock`
-- node snapshot root: `/var/lib/ate`
-
-The `config/` component replaces those sidecars' image and arguments with this
-plugin's, removes the base `ATE_STORAGE_BACKEND`, adds the workload identity
-environment and projected token, and points their startup probes at
-`azure-blob-objectstore-plugin healthcheck`, which reports whether the plugin at
-`--socket` is serving gRPC health. It leaves the caller containers and the
-socket volume as the base defines them. The base control sidecar's credential
-exchange settings also stay: the `exchange` port, `ATE_API_ACTOR_JWT_ISSUER`,
-`POD_NAMESPACE`, and the `servicedns`, `podidentity` and `actor-id-jwt-jwks`
-mounts; this plugin serves no exchange and reads none of them. The
-`ATE_API_SNAPSHOT_TRANSFER_SERVICE_ACCOUNT` variable still comes from the
-ConfigMap key ate-setup writes, so a hand-written ConfigMap must still carry
-that key for the pod to start. On the kind overlay, the `AWS_*` variables its
-RustFS patches add also stay on both sidecars; the plugin reads none of them.
-
-## Snapshot URIs
-
-The plugin accepts:
-
-```text
-azblob://<container>/<snapshot-prefix>
-```
-
-`<container>` must be one of `--containers`, and `CopySnapshot` may copy
-between any two of them. `--prefix`, when set, is prepended to every snapshot
-prefix in every container, allowing all substrate data to live below one
-directory. The blob name prefix is the URI's percent-decoded path, so
-`root%2Fsub` and `root/sub` name the same blobs, as they do in substrate's
-objectstore-plugin. A bare container, userinfo, a query or fragment, `\`, and `.`,
-`..` or other path segments made only of dots and spaces are rejected.
-
-## Sandbox assets
-
-In `node` mode with `--asset-containers` set (the `config/assets` component
-sets it), the plugin also serves
-`AssetProvider.FetchAsset`, which atelet calls for every sandbox asset URL
-that is not `gs://` (for example the micro-VM kernel, rootfs,
-`cloud-hypervisor` and `virtiofsd` in a `SandboxConfig`). Asset URLs use the
-blob's native URL in the plugin's account:
-
-```text
-https://<account>.blob.core.windows.net/<container>/<blob>
-```
-
-`<container>` must be one of `--asset-containers`; it may also be a snapshot
-container. The blob name is used as is: `--prefix` does not apply. A URL on
-another host, with a query (such as a SAS token), user info or a fragment, or
-with a non-canonical blob name (empty, `.`-terminated or space-padded
-segments, `\`) is rejected with `InvalidArgument`.
-
-The plugin applies the same two checks as substrate's objectstore-plugin,
-through substrate's `pkg/assetfetch`:
-
-- It refuses, with `PermissionDenied` and before any download, any blob
-  stored under a snapshot or tag location
-  (`.../atespaces/<atespace>/actors/<uid>/snapshots/<name>/...` or
-  `.../atespaces/<atespace>/tags/<uid>/...`) in any container, so the node
-  identity's read access to snapshots cannot be used to read them as assets.
-- It downloads into `--asset-staging-dir`, which only the plugin container
-  mounts, stops at `max_bytes`, verifies the requested sha256, and only then
-  atomically replaces atelet's existing file with the bytes. atelet verifies
-  the sha256 again.
-
-Downloads in flight hold at most `--asset-staging-capacity` bytes in the
-staging directory together: each reserves its blob's size, and one that does
-not fit waits for the others. A blob larger than the capacity is refused with
-`FailedPrecondition`. The default, `8Gi`, matches atelet's per-asset cap and
-the base manifest's `asset-staging` volume.
-
-The node identity needs `Storage Blob Data Reader` on each asset container
-that is not also a snapshot container.
-
-Without `--asset-containers`, atelet's plugin serves no assets and atelet gets
-`Unimplemented`: it still reads public `gs://` assets, such as the default
-gVisor release, anonymously, and fails any other asset URL. The `config/`
-component alone is therefore a snapshot-only install; see
-[Deployment](#deployment) for adding assets.
+- Snapshot URIs are `azblob://<container>/<path>`, with `<container>` in
+  `--containers`. `--prefix` is prepended to `<path>`.
+- Each snapshot file is one block blob with its SHA-256 in metadata, which
+  fetch and copy verify.
+- Asset URLs are blob URLs under `--account-url`, such as
+  `https://<account>.blob.core.windows.net/<container>/<blob>`, with
+  `<container>` in `--asset-containers`. `--prefix` does not apply. Blobs under
+  a snapshot or tag location are refused.
 
 ## Configuration
 
-| Flag | Environment fallback | Default | Purpose |
+| Flag | Environment fallback | Default | Meaning |
 |---|---|---|---|
-| `--account-url` | `AZURE_STORAGE_ACCOUNT_URL` | required | `https://<account>.blob.core.windows.net` |
-| `--containers` | `AZURE_STORAGE_CONTAINERS` | required | Comma-separated blob containers that snapshot URIs may name; a name that breaks Azure's container naming rules fails startup |
-| `--prefix` | `AZURE_STORAGE_PREFIX` | empty | Prefix prepended to every snapshot key |
-| `--socket` | none | required | Unix socket to serve |
-| `--root` | none | `/var/lib/ate` | Node mode's allowed local snapshot and asset tree |
-| `--asset-containers` | `AZURE_STORAGE_ASSET_CONTAINERS` | empty | Node mode: comma-separated blob containers that sandbox asset URLs may name; empty serves no assets (atelet then gets `Unimplemented`) |
-| `--asset-staging-dir` | none | `/var/lib/objectstore-plugin/asset-staging` | Node mode: private directory assets are downloaded into and verified in; must not be below `--root` |
-| `--asset-staging-capacity` | none | `8Gi` | Node mode: the most asset downloads in `--asset-staging-dir` may hold at once, as a Kubernetes quantity |
+| `--socket` | | required | Unix socket to serve |
+| `--account-url` | `AZURE_STORAGE_ACCOUNT_URL` | required | Account endpoint, such as `https://<account>.blob.core.windows.net`; must be https; requests and tokens go only to this host, without redirects |
+| `--containers` | `AZURE_STORAGE_CONTAINERS` | required | Comma-separated snapshot containers |
+| `--prefix` | `AZURE_STORAGE_PREFIX` | empty | Blob name prefix for all snapshots |
+| `--root` | | `/var/lib/ate` | Node mode: local directory that snapshot and asset paths must be under |
+| `--asset-containers` | `AZURE_STORAGE_ASSET_CONTAINERS` | empty | Node mode: comma-separated asset containers; empty serves no assets |
+| `--asset-staging-dir` | | `/var/lib/objectstore-plugin/asset-staging` | Node mode: private download directory, outside `--root` |
+| `--asset-staging-capacity` | | `8Gi` | Node mode: total size of asset downloads in progress |
 
-`healthcheck` mode takes `--socket` and `--timeout` (default `5s`) and exits
-non-zero unless the plugin at `--socket` reports `SERVING` within the timeout.
-
-The account URL must use `https`. The plugin sends requests, and with them its
-storage token, only to the scheme and host of `--account-url`: it refuses a
-request to any other endpoint and does not follow redirects. Snapshot URIs
-name only a container and prefix, never a host, so no request can choose
-where the token goes.
-
-## Authentication
-
-The plugin authenticates to Azure Storage only with Microsoft Entra workload
-identity federation: it exchanges the pod's projected service account token for
-an Entra token. It does not accept storage account keys, connection strings,
-SAS tokens, client secrets or certificates, and never authenticates as the
-node's managed identity. It reads the standard `azidentity` variables:
-
-| Variable | Value |
-|---|---|
-| `AZURE_CLIENT_ID` | Client ID of the user-assigned managed identity whose federated identity credential trusts the cluster's service account token issuer |
-| `AZURE_TENANT_ID` | Microsoft Entra tenant ID |
-| `AZURE_FEDERATED_TOKEN_FILE` | Path of the projected service account token |
-
-The plugin fails at startup, naming the missing variables, when any of them is
-unset or the token file cannot be read. It has no other credential to fall
-back to.
-
-Create federated identity credentials with audience
-`api://AzureADTokenExchange`, the cluster's service account issuer, and these
-subjects:
-
-```text
-system:serviceaccount:ate-system:atelet
-system:serviceaccount:ate-system:ate-api-server
-```
-
-Microsoft Entra ID must be able to fetch the issuer's OIDC discovery document
-and signing keys.
-
-Grant each identity `Storage Blob Data Contributor` scoped to each container in
-`--containers`:
-
-```bash
-CONTAINER_SCOPE="/subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>"
-az role assignment create \
-  --assignee-object-id <principal-object-id> \
-  --assignee-principal-type ServicePrincipal \
-  --role "Storage Blob Data Contributor" \
-  --scope "$CONTAINER_SCOPE"
-```
-
-`ServicePrincipal` is the principal type Azure role assignments use for
-managed identities as well, so it is correct for a user-assigned managed
-identity; no client secret or certificate is involved.
-
-The identity federated to `system:serviceaccount:ate-system:atelet` (the
-plugin in `node` mode) needs blob read/write access. The identity federated to
-`system:serviceaccount:ate-system:ate-api-server` (the plugin in `control` mode)
-needs blob read/write/delete access; the built-in role above covers both.
+The plugin also reads `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and
+`AZURE_FEDERATED_TOKEN_FILE`, and exits at startup if any is unset or the token
+file is unreadable. It accepts no account keys, SAS tokens or client secrets.
 
 ## Deployment
 
-Clone this repository and build and push the image:
+### 1. Build the image
+
+No release images are published yet. Build and push one with
+[ko](https://ko.build); the last line it prints is the image reference:
 
 ```bash
 KO_DOCKER_REPO=<registry> make build-image
 ```
 
-The `config/` component configures workload identity: it projects a service
-account token with audience `api://AzureADTokenExchange` into both sidecars and
-sets their `AZURE_*` variables, without a webhook mutating the whole Pod. Edit
-`config/kustomization.yaml` to set:
+### 2. Set up Azure
 
-- both `example.invalid/replace-with-azure-blob-objectstore-plugin:latest` image
-  fields to the digest reference printed by `make build-image`;
-- both client IDs and the tenant ID;
-- the storage account URL;
-- the containers;
-- the optional storage prefix.
+Create two user-assigned managed identities, each with a federated credential
+for the cluster's service account issuer, audience `api://AzureADTokenExchange`.
+Microsoft Entra ID must be able to fetch the issuer's OIDC discovery document.
 
-`ate-setup` has no option to add a component, so add this one, by its path
-relative to the overlay, to the overlay that `ate-setup deploy ate-system`
-renders in your substrate checkout: `manifests/ate-install/base` by default,
-or `manifests/ate-install/kind` with `--kind`. For example, with this
-repository cloned next to substrate, in
-`manifests/ate-install/kind/kustomization.yaml`:
+| Identity | Federated credential subject | Roles |
+|---|---|---|
+| Control | `system:serviceaccount:ate-system:ate-api-server` | `Storage Blob Data Contributor` on each snapshot container |
+| Node | `system:serviceaccount:ate-system:atelet` | `Storage Blob Data Contributor` on each snapshot container; `Storage Blob Data Reader` on each asset container that is not a snapshot container |
 
-```yaml
-components:
-- ../../../../objectstore-azure-blob/config
-```
+### 3. Fill in the components
 
-To serve sandbox assets from blob containers as well, replace the
-`REPLACE_WITH_ASSET_CONTAINERS` placeholder in `config/assets/kustomization.yaml`
-with a comma-separated list of containers, grant the node identity read access
-to them, and list that component after the first:
+[`config/`](config/kustomization.yaml) sets both sidecars' image, arguments,
+workload identity and startup probe;
+[`config/assets/`](config/assets/kustomization.yaml) adds asset serving to the
+node sidecar. Replace the placeholders:
 
-```yaml
-components:
-- ../../../../objectstore-azure-blob/config
-- ../../../../objectstore-azure-blob/config/assets
-```
-
-A `SandboxConfig` version then names each asset by its blob URL and sha256, for
-example:
-
-```yaml
-assets:
-  amd64:
-    kata-kernel:
-      url: https://<account>.blob.core.windows.net/<container>/kata/vmlinux
-      sha256: <sha256 of the blob>
-```
-
-Then install from the substrate repository root:
-
-```bash
-go run ./cmd/ate-setup deploy ate-system \
-  --kind \
-  --context <context> \
-  --ko-docker-repo <registry> \
-  --ko-default-platforms linux/amd64 \
-  --credential-provider='{"name":"k8s.io"}' \
-  --snapshot-location=azblob://<container>/<snapshot-root>/
-```
-
-`--kind` selects the kind overlay. It does not create a kind cluster, but it
-defaults several settings to a local kind setup, including the context,
-registry, and build platform, so name all three for any other cluster. It
-also defaults the snapshot location to `gs://ate-snapshots/`, which this plugin
-rejects, so set `--snapshot-location` on kind too.
-
-On any other cluster, ate-setup currently installs for GKE: `deploy ate-system`
-refuses to start without `--snapshot-transfer-gsa-name` and
-`--gcp-project-id`, which configure the GCS credential exchange this plugin
-replaces. The plugin reads neither.
-
-Only `deploy ate-system` renders that overlay. `deploy atelet` and
-`deploy apiserver` apply their manifests without it, which puts the base
-`objectstore-plugin` sidecars back, so redeploy with `deploy ate-system`.
-
-The component changes only the sidecars. atelet and ate-api-server have no
-object storage settings of their own. atelet still needs the node's kubelet
-image credential provider from the chosen overlay to pull private actor
-images: `base` uses GKE's credential provider paths, and the kind overlay pulls
-actor images without credentials.
-
-## Snapshot location
-
-ate-api-server stores snapshots under `--snapshot-location`, which must be an
-`azblob://` URI in one of the configured containers. With the
-`PerTemplateSnapshotLocation` preview gate, an ActorTemplate's
-`snapshotConfig.storageLocation` overrides it and must meet the same rule.
-Without the gate, ate-api-server ignores that field. See
-[Snapshot storage](https://github.com/agent-substrate/substrate/blob/main/docs/operator-install.md#snapshot-storage).
-
-## Error behavior
-
-| Condition | gRPC code |
+| Placeholder | Value |
 |---|---|
-| Invalid URI, local path, or file list | `InvalidArgument` |
-| Requested blob absent during fetch | `NotFound` |
-| Configured container absent (cleanup succeeds instead) | `FailedPrecondition` |
-| Empty copy source | `FailedPrecondition` |
-| Azure Storage returns HTTP 401 or 403 | `PermissionDenied` |
-| Azure throttling, timeout, or server failure | `Unavailable` |
-| Connection failure, DNS server failure, or DNS timeout after the SDK's retries, or a download that fails after resuming | `Unavailable` |
-| Storage request that makes no progress for one minute (sending, awaiting the response, or one body read), after the SDK's retries | `Unavailable` |
-| Unknown storage account host name | `Internal` |
-| Microsoft Entra token request throttled, timed out, failed with a server error, or got no response | `Unavailable` |
-| Microsoft Entra rejects the token request | `Internal` |
-| Blob replaced while a download was resuming | `Unavailable` |
-| Context canceled or deadline exceeded | `Canceled` / `DeadlineExceeded` |
-| SHA-256 metadata absent, invalid, or mismatched | `DataLoss` |
-| Other local or Azure failures | `Internal` |
+| `example.invalid/replace-with-azure-blob-objectstore-plugin:latest` | Image reference from step 1 |
+| `REPLACE_WITH_ACCOUNT` | Storage account name |
+| `REPLACE_WITH_CONTAINERS` | Comma-separated snapshot containers |
+| `REPLACE_WITH_TENANT_ID` | Entra tenant ID |
+| `REPLACE_WITH_CONTROL_CLIENT_ID` | Control identity client ID |
+| `REPLACE_WITH_NODE_CLIENT_ID` | Node identity client ID |
+| `REPLACE_WITH_ASSET_CONTAINERS` (in `config/assets/`) | Comma-separated asset containers |
 
-`FetchAsset` differs where its codes carry a narrower meaning:
-`PermissionDenied` means a refused snapshot location, so an Azure 401 or 403
-is `Internal`; an absent asset container is `NotFound`; and a size or sha256
-mismatch is `FailedPrecondition`. A 401 or 403 refuses the plugin's own
-identity, not the URL; atelet reads an asset anonymously after `Internal` only
-for `gs://` URLs, which this plugin never reads.
+Keep `--containers` and `--prefix` (`substrate` in `config/`) the same in both
+sidecars: the control sidecar copies and deletes what the node sidecar writes.
 
-## Limitations and open edges
+### 4. Install substrate
 
-- atelet sends an `actor_jwt` with every snapshot transfer. The plugin
-  ignores it and does not authorize per actor: the node identity can read and
-  write every snapshot in the configured containers and prefix.
-- A failed staged-block upload can leave uncommitted blocks. Azure expires
-  uncommitted blocks after seven days. `CleanupSnapshot` deletes committed
-  blobs under the caller-selected prefix; Azure does not expose uncommitted
-  blocks through prefix listing.
-- Native Azure blob snapshots of blobs in the configured `--containers` block
-  actor snapshot deletion until the operator removes them (`CleanupSnapshot`
-  fails with `Internal`, Azure error `SnapshotsPresent`); the plugin never
-  deletes them itself.
-- A file is staged in 4 MiB blocks, or, above 50,000 such blocks (about
-  195 GiB), in blocks of its size divided by 50,000, rounded up to a whole MiB.
-  One file can therefore reach Azure's block blob limit of 50,000 blocks of
-  4,000 MiB (about 190.7 TiB). `UploadSnapshot` refuses a request holding a
-  larger file with `InvalidArgument` before it stages any block.
-- `UploadSnapshot` reads each block of a file twice: once to hash it, through
-  a 1 MiB buffer, and once, from the file, as the SDK sends it. It stages up to
-  eight blocks at once and holds no block in memory, whatever the block size.
-  Azure checks each block against the MD5 of the first read, so a block that
-  changes between the two reads fails the upload.
-- `CopySnapshot` holds each source block in memory until it is staged, at most
-  32 MiB at once, when blocks are up to 32 MiB (blobs up to about 1.5 TiB).
-  Larger blocks are staged from a second, ranged download of the source, like
-  file blocks, so a copy holds no more than 32 MiB of block data at any size.
-- These bounds are per RPC, not process-wide, so concurrent uploads and copies
-  multiply the memory use, and each block in flight also holds the HTTP
-  client's buffers.
-- One plugin process is confined to one storage account and the containers in
-  `--containers`. Copying snapshots across accounts is not supported.
+ate-setup has no option to add a component. Add the components, by path
+relative to the overlay, to the overlay `ate-setup deploy ate-system` renders
+in your substrate checkout: `manifests/ate-install/base`, or
+`manifests/ate-install/kind` with `--kind`. With this repository cloned next
+to substrate:
+
+```yaml
+components:
+- ../../../../objectstore-azure-blob/config
+- ../../../../objectstore-azure-blob/config/assets  # only to serve assets
+```
+
+Then run `ate-setup deploy ate-system` as its
+[commands guide](https://github.com/agent-substrate/substrate/blob/v1.0.0/cmd/ate-setup/commands.md#deploy)
+describes, with:
+
+- `--snapshot-location=azblob://<container>/<path>/`, with `<container>` in
+  `--containers` and path segments of only ASCII letters, digits, `_` and `-`
+  (see [snapshot storage](https://github.com/agent-substrate/substrate/blob/v1.0.0/docs/guides/operator-install.md#snapshot-storage)).
+- `--sandbox-classes=gvisor`: the default also installs a microVM
+  `SandboxConfig` whose `gs://` or `s3://` asset URLs this plugin cannot read.
+- Without `--kind`, ate-setup v1.0.0 also requires
+  `--snapshot-transfer-gsa-name` and `--gcp-project-id`, which the plugin
+  does not use. Also pass `--context=<kubeconfig context>`, or ate-setup
+  tries to fetch GKE credentials for that project.
+
+Only `deploy ate-system` renders the overlay; `deploy atelet` and
+`deploy apiserver` put the default sidecars back. To serve an asset with the
+plugin, set its `url` in a `SandboxConfig` to the blob URL and its `sha256` to
+that blob's SHA-256; atelet passes the configured digest to the plugin, which
+refuses a blob that does not match it.
+
+## Error codes
+
+| Condition | Snapshot RPCs | `FetchAsset` |
+|---|---|---|
+| Invalid URI, local path or file list; container not configured | `InvalidArgument` | `InvalidArgument` |
+| File too large for one block blob | `InvalidArgument` | |
+| Blob absent on fetch | `NotFound` | `NotFound` |
+| Configured container absent in Azure (cleanup succeeds) | `FailedPrecondition` | `NotFound` |
+| Empty copy source | `FailedPrecondition` | |
+| Asset larger than `max_bytes` or `--asset-staging-capacity`; SHA-256 mismatch; `write_path` missing or not a regular file | | `FailedPrecondition` |
+| Asset under a snapshot or tag location | | `PermissionDenied` |
+| Azure Storage returns 401 or 403 | `PermissionDenied` | `Internal` |
+| Throttling, timeout, 5xx, connection failure or stall after retries; blob changed mid-download | `Unavailable` | `Unavailable` |
+| Blob SHA-256 metadata missing or mismatched | `DataLoss` | |
+| Context canceled or deadline exceeded | `Canceled`, `DeadlineExceeded` | same |
+| Anything else, including Entra rejecting the token request | `Internal` | `Internal` |
+
+## Limitations
+
+- No per-actor authorization: the plugin ignores the actor JWT, so the node
+  identity can read and write every snapshot in its containers.
+- One storage account per process; no copies across accounts.
+- A failed upload can leave uncommitted blocks; Azure deletes them after
+  seven days.
+- Native Azure blob snapshots block deletion: `CleanupSnapshot` fails with
+  `Internal` until you remove them.
+- A file is limited to Azure's block blob maximum, 50,000 blocks of 4,000 MiB.
+- Each `CopySnapshot` holds up to 32 MiB of block data in memory; concurrent
+  copies add up.
 
 ## Development
 
 ```bash
-make build
-make test
-make verify
-make fmt
+make build             # go build ./...
+make test              # unit tests with -race
+make verify            # gofmt, go vet with and without the integration tag, go mod tidy
+make fmt               # gofmt -w
+make test-integration  # integration tests against Azurite; needs Docker
 ```
 
-The integration tests use the real Azure Blob SDK and the gRPC services over
-a Unix socket, against Azurite. They fail rather than skip when their Azurite
-configuration is absent. `make test-integration` runs
-`hack/test-azurite.sh`, which starts a pinned Azurite image with Docker on
-`127.0.0.1:${AZURITE_PORT:-10000}`, runs every test in the module with the
-`integration` tag and `-race`, and removes the container; PR CI runs the same
-script.
-
-The test uploads and restores a 320 MiB file with distinct per-block patterns,
-retries a partial block upload, verifies corrupt data is rejected, exercises
-concurrent uploads, and checks both control RPCs. Another uploads and copies
-blocks larger than 32 MiB, which are streamed rather than buffered.
-
-The import-boundary test rejects imports of substrate packages outside `api/`
-and `pkg/`.
+[`hack/test-azurite.sh`](hack/test-azurite.sh) starts a pinned Azurite image on
+`127.0.0.1:${AZURITE_PORT:-10000}`, runs every test with the `integration` tag
+and `-race` (arguments replace the `go test` command), and removes the
+container. Integration tests fail, not skip, without Azurite. PR CI runs
+`make verify`, `make test` and `make test-integration`.
