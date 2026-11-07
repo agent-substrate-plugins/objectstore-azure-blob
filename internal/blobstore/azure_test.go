@@ -18,11 +18,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -360,7 +362,12 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		{name: "truncated body", err: io.ErrUnexpectedEOF, transient: true},
 		{name: "connection closed before response", err: &url.Error{Op: "Get", URL: "https://a", Err: io.EOF}, transient: true},
 		{name: "TLS handshake timeout", err: timeoutError{}, transient: true},
+		{name: "proxy refused", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}}, transient: true},
+		{name: "write to a closed connection", err: &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}, transient: true},
 		{name: "unknown host", err: &net.DNSError{Err: "no such host", Name: "a", IsNotFound: true}},
+		{name: "TLS alert", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "remote error", Err: tlsAlert("handshake failure")}}},
+		{name: "TLS alert through a proxy", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.OpError{Op: "remote error", Err: tlsAlert("handshake failure")}}}},
+		{name: "local TLS alert", err: &net.OpError{Op: "local error", Err: tlsAlert("protocol version not supported")}},
 		{name: "foreign endpoint", err: &foreignEndpointError{scheme: "https", host: "other", want: "https://a"}},
 		{name: "canceled", err: &url.Error{Op: "Get", URL: "https://a", Err: context.Canceled}},
 		{name: "deadline", err: &url.Error{Op: "Get", URL: "https://a", Err: context.DeadlineExceeded}},
@@ -380,6 +387,12 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		t.Fatalf("mapError(ConditionNotMet) = %v, want ErrUnavailable", got)
 	}
 }
+
+// tlsAlert stands in for crypto/tls's unexported alert type, which reports
+// itself as neither a timeout nor temporary.
+type tlsAlert string
+
+func (a tlsAlert) Error() string { return "tls: " + string(a) }
 
 type timeoutError struct{}
 
@@ -403,6 +416,26 @@ func TestAzureConnectionFailureIsUnavailable(t *testing.T) {
 	}
 	if err := store.StageBlock(ctx, "prefix/file", "YmxvY2s=", strings.NewReader("x"), nil); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("StageBlock = %v, want ErrUnavailable", err)
+	}
+}
+
+// TestAzureTLSAlertIsNotUnavailable runs against an endpoint that ends every
+// handshake with a TLS alert, which a later attempt would hit again.
+func TestAzureTLSAlertIsNotUnavailable(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.NotFoundHandler())
+	server.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	defer server.Close()
+
+	store := newTokenStore(t, server.URL, staticCredential{}, server.Client().Transport, policy.RetryOptions{MaxRetries: -1})
+	err := store.Delete(t.Context(), "prefix/file")
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "remote error" {
+		t.Fatalf("Delete = %v, want a TLS alert", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Delete = %v, want a TLS alert not to be ErrUnavailable", err)
 	}
 }
 

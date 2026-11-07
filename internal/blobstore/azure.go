@@ -291,7 +291,7 @@ func mapAuthenticationError(err error, authErr *azidentity.AuthenticationFailedE
 // not hit: the SDK has already retried the request, or the download resumed,
 // as many times as it allows. A request the endpoint check refused and an
 // expired or canceled context are not transient, and neither is a host name
-// that does not exist.
+// that does not exist or a TLS alert, such as a failed handshake.
 func transient(err error) bool {
 	var foreign *foreignEndpointError
 	if errors.As(err, &foreign) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -303,7 +303,14 @@ func transient(err error) bool {
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		return true
+		switch opErr.Op {
+		case "dial", "read", "write":
+			return true
+		case "proxyconnect":
+			// net/http wraps any failure to reach the storage endpoint
+			// through a proxy, including a TLS alert, in this op.
+			return transient(opErr.Err)
+		}
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
