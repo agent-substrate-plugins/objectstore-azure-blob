@@ -359,6 +359,26 @@ func TestNewAzureRequiresHTTPS(t *testing.T) {
 	}
 }
 
+// TestNewAzureRejectsAccountURLPath checks that a container URL given as the
+// account URL fails instead of nesting every container under it.
+func TestNewAzureRejectsAccountURLPath(t *testing.T) {
+	for _, accountURL := range []string{
+		"https://acct.blob.core.windows.net/data",
+		"https://acct.blob.core.windows.net/data/nested",
+		"https://127.0.0.1:10000/devstoreaccount1",
+	} {
+		_, err := NewAzure(accountURL, []string{"snapshots"}, staticCredential{})
+		if err == nil || !strings.Contains(err.Error(), "must not have a path") {
+			t.Errorf("NewAzure(%q) = %v, want a path error", accountURL, err)
+		}
+	}
+	for _, accountURL := range []string{"https://acct.blob.core.windows.net", "https://acct.blob.core.windows.net/"} {
+		if _, err := NewAzure(accountURL, []string{"snapshots"}, staticCredential{}); err != nil {
+			t.Errorf("NewAzure(%q) = %v, want nil", accountURL, err)
+		}
+	}
+}
+
 // newTokenStore returns the store for container "snapshots" in the account at
 // accountURL.
 func newTokenStore(t *testing.T, accountURL string, credential azcore.TokenCredential, base http.RoundTripper, retry policy.RetryOptions) Store {

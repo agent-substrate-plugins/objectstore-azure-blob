@@ -127,9 +127,10 @@ component alone is therefore a snapshot-only install; see
 `healthcheck` mode takes `--socket` and `--timeout` (default `5s`) and exits
 non-zero unless the plugin at `--socket` reports `SERVING` within the timeout.
 
-The account URL must use `https`. The plugin sends requests, and with them its
-storage token, only to the scheme and host of `--account-url`: it refuses a
-request to any other endpoint and does not follow redirects. Snapshot URIs
+The account URL must use `https` and have no path; a container URL fails
+startup. The plugin sends requests, and with them its storage token, only to
+the scheme and host of `--account-url`: it refuses a request to any other
+endpoint and does not follow redirects. Snapshot URIs
 name only a container and prefix, never a host, so no request can choose
 where the token goes.
 

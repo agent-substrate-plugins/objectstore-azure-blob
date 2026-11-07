@@ -45,8 +45,8 @@ type Azure struct {
 
 // NewAzure returns a Store for each of containers in the account served at
 // accountURL. The stores share one client, so one connection pool and one
-// token cache. accountURL must use https, and the stores send requests, and
-// with them the credential, only to that scheme and host.
+// token cache. accountURL must use https and have no path, and the stores
+// send requests, and with them the credential, only to that scheme and host.
 func NewAzure(accountURL string, containers []string, credential azcore.TokenCredential) (map[string]Store, error) {
 	return newTokenAzure(accountURL, containers, credential, defaultTransport(), policy.RetryOptions{}, defaultStallTimeout)
 }
@@ -58,6 +58,12 @@ func newTokenAzure(accountURL string, containers []string, credential azcore.Tok
 	}
 	if endpoint.Scheme != "https" {
 		return nil, fmt.Errorf("Azure Blob account URL %q must use https", RedactURL(accountURL))
+	}
+	// The SDK appends the container to the URL's path, so a container URL
+	// would put every blob in that container instead. Only the shared key
+	// constructor accepts a path, for Azurite's path-style account URLs.
+	if endpoint.Path != "" && endpoint.Path != "/" {
+		return nil, fmt.Errorf("Azure Blob account URL %q must not have a path: use https://<account>.blob.core.windows.net, not a container URL", RedactURL(accountURL))
 	}
 	client, err := service.NewClient(accountURL, credential, clientOptions(endpoint, base, retry, stallTimeout))
 	if err != nil {
