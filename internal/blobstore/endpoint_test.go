@@ -27,6 +27,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -308,54 +309,89 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { re
 
 // TestResentRequestBodyRestartsStallTimer sends the body from GetBody, as
 // net/http does when it retries on a new connection, one byte at a time over
-// more than the stall timeout: each read is progress.
+// more than the stall timeout: each read is progress, unless the transport
+// waits longer than the stall timeout between two reads. It runs in a
+// synctest bubble, so the stall timer and the waits use the bubble's clock.
 func TestResentRequestBodyRestartsStallTimer(t *testing.T) {
 	const data = "block data"
-	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.GetBody == nil {
-			return nil, errors.New("request has no GetBody")
-		}
-		body, err := req.GetBody()
-		if err != nil {
-			return nil, err
-		}
-		var got []byte
-		b := make([]byte, 1)
-		for {
-			n, err := body.Read(b)
-			got = append(got, b[:n]...)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return nil, err
-			}
-			time.Sleep(testStallTimeout / 2)
-		}
-		if err := req.Context().Err(); err != nil {
-			return nil, fmt.Errorf("context after sending %q: %w", got, err)
-		}
-		return &http.Response{StatusCode: http.StatusCreated, Body: http.NoBody, Request: req}, nil
-	})
-	endpoint, err := url.Parse("https://account.blob.core.windows.net")
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name    string
+		gap     time.Duration
+		stalled bool
+	}{
+		{name: "reads within the timeout", gap: testStallTimeout - time.Millisecond},
+		{name: "one wait past the timeout", gap: testStallTimeout + time.Millisecond, stalled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.GetBody == nil {
+						return nil, errors.New("request has no GetBody")
+					}
+					body, err := req.GetBody()
+					if err != nil {
+						return nil, err
+					}
+					var got []byte
+					b := make([]byte, 1)
+					for {
+						n, err := body.Read(b)
+						got = append(got, b[:n]...)
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							return nil, err
+						}
+						time.Sleep(tc.gap)
+					}
+					if err := req.Context().Err(); err != nil {
+						return nil, fmt.Errorf("context after sending %q: %w", got, err)
+					}
+					return &http.Response{StatusCode: http.StatusCreated, Body: http.NoBody, Request: req}, nil
+				})
+				endpoint := mustParseURL(t, "https://account.blob.core.windows.net")
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, endpoint.String()+"/snapshots/file", strings.NewReader(data))
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := newEndpointTransport(endpoint, base, testStallTimeout).Do(req)
+				var stallErr *stallError
+				if got := errors.As(err, &stallErr); got != tc.stalled {
+					t.Fatalf("Do() = %v, want a stall error: %v", err, tc.stalled)
+				}
+				if err == nil {
+					_ = resp.Body.Close()
+				}
+			})
+		})
 	}
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, endpoint.String()+"/snapshots/file", strings.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := newEndpointTransport(endpoint, base, testStallTimeout).Do(req)
-	if err != nil {
-		t.Fatalf("Do() = %v, want the resent body to count as progress", err)
-	}
-	_ = resp.Body.Close()
 }
 
 func TestNewAzureRequiresHTTPS(t *testing.T) {
 	_, err := NewAzure("http://account.blob.core.windows.net", []string{"snapshots"}, staticCredential{})
 	if err == nil || !strings.Contains(err.Error(), "must use https") {
 		t.Fatalf("NewAzure(http) = %v, want https error", err)
+	}
+}
+
+// TestNewAzureRejectsAccountURLPath checks that a container URL given as the
+// account URL fails instead of nesting every container under it.
+func TestNewAzureRejectsAccountURLPath(t *testing.T) {
+	for _, accountURL := range []string{
+		"https://acct.blob.core.windows.net/data",
+		"https://acct.blob.core.windows.net/data/nested",
+		"https://127.0.0.1:10000/devstoreaccount1",
+	} {
+		_, err := NewAzure(accountURL, []string{"snapshots"}, staticCredential{})
+		if err == nil || !strings.Contains(err.Error(), "must not have a path") {
+			t.Errorf("NewAzure(%q) = %v, want a path error", accountURL, err)
+		}
+	}
+	for _, accountURL := range []string{"https://acct.blob.core.windows.net", "https://acct.blob.core.windows.net/"} {
+		if _, err := NewAzure(accountURL, []string{"snapshots"}, staticCredential{}); err != nil {
+			t.Errorf("NewAzure(%q) = %v, want nil", accountURL, err)
+		}
 	}
 }
 
