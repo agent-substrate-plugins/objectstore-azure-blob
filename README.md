@@ -40,6 +40,15 @@ reports data as a hole would upload zeros in its place undetected. The plugin
 relies on the file system reporting holes correctly, as `cp` and substrate's
 own sparse copies do.
 
+The format follows the sparse-extent format of substrate's in-tree object
+storage
+([`pkg/objectstorage/sparsezstd.go`](https://github.com/agent-substrate/substrate/blob/v1.0.0/pkg/objectstorage/sparsezstd.go)),
+which also uploads only populated ranges as `(offset, length, data)` frames and
+restores them into a file truncated to its logical size. It is not compatible
+with it: these blobs are uncompressed, start with their own magic, and are
+chosen by `substrate_format` metadata rather than by their first bytes. Each
+plugin's storage format is private to it, as the snapshot API allows.
+
 ## Compatibility
 
 The plugin needs substrate v1.0.0 or later, the first release that serves the

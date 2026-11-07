@@ -35,7 +35,9 @@ import (
 // Integers are little-endian. Each frame holds one of the file's populated
 // extents, in order, each non-empty and none overlapping. Every byte outside
 // the frames is zero. A frame's position precedes its data, so a decoder
-// writes each frame as it reads it and holds no table of them.
+// writes each frame as it reads it and holds no table of them. The layout
+// follows substrate's pkg/objectstorage sparse-extent format, without its
+// zstd compression, and is not compatible with it.
 //
 // The blob's formatMetadata names the format, and its integrityMetadata is the
 // SHA-256 of the blob's bytes, so verifying or copying a blob never decodes it.
