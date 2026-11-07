@@ -47,7 +47,12 @@ import (
 	"plugins.go.ate.dev/objectstore-azure-blob/internal/blobstore"
 )
 
-const largeIntegrationFileSize = 320 * 1024 * 1024
+const (
+	largeIntegrationFileSize = 320 * 1024 * 1024
+	// largeIntegrationExtent bytes of data start every minBlockSize bytes of
+	// the large file; the rest of it is holes.
+	largeIntegrationExtent = 1024 * 1024
+)
 
 type failStageStore struct {
 	blobstore.Store
@@ -121,7 +126,7 @@ func TestAzuriteGRPCEndToEnd(t *testing.T) {
 	}
 	for offset := int64(0); offset < largeIntegrationFileSize; offset += minBlockSize {
 		pattern := sha256.Sum256([]byte(fmt.Sprintf("block-%d", offset/minBlockSize)))
-		if _, err := file.WriteAt(pattern[:], offset); err != nil {
+		if _, err := file.WriteAt(bytes.Repeat(pattern[:], largeIntegrationExtent/len(pattern)), offset); err != nil {
 			file.Close()
 			t.Fatal(err)
 		}
@@ -159,6 +164,20 @@ func TestAzuriteGRPCEndToEnd(t *testing.T) {
 		t.Fatalf("fetched size = %d, want %d", info.Size(), largeIntegrationFileSize)
 	}
 	assertFileHash(t, largePath, filepath.Join(dest, "memory.img"))
+	if holesSupported(t, source) {
+		const extents = largeIntegrationFileSize / minBlockSize
+		download, err := azure.Download(context.Background(), "integration/large/memory.img")
+		if err != nil {
+			t.Fatal(err)
+		}
+		download.Body.Close()
+		if want := int64(sparseFixedHeaderV1 + extents*(sparseFrameHeaderV1+largeIntegrationExtent)); download.Size != want {
+			t.Errorf("blob holds %d bytes, want %d: a header and the file's populated bytes", download.Size, want)
+		}
+		if got, limit := allocatedBytes(t, filepath.Join(dest, "memory.img")), int64(extents*largeIntegrationExtent+allocationSlack); got > limit {
+			t.Errorf("restore allocated %d bytes, want at most its %d data bytes plus %d", got, extents*largeIntegrationExtent, allocationSlack)
+		}
+	}
 
 	const concurrency = 4
 	errs := make(chan error, concurrency)
@@ -272,7 +291,7 @@ func TestAzuriteGRPCEndToEnd(t *testing.T) {
 		t.Fatalf("missing FetchSnapshot code = %v, want NotFound", status.Code(err))
 	}
 
-	corruptData := []byte("corrupt")
+	corruptData := denseEncodingV1([]byte("corrupt"))
 	sum := md5.Sum(corruptData)
 	blockID := base64.StdEncoding.EncodeToString([]byte("corrupt-block"))
 	corruptName := "integration/corrupt/file"
@@ -280,7 +299,8 @@ func TestAzuriteGRPCEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongDigest := hex.EncodeToString(make([]byte, sha256.Size))
-	if err := azure.CommitBlockList(context.Background(), corruptName, []string{blockID}, map[string]*string{integrityMetadata: &wrongDigest}); err != nil {
+	format := sparseFormatV1
+	if err := azure.CommitBlockList(context.Background(), corruptName, []string{blockID}, map[string]*string{integrityMetadata: &wrongDigest, formatMetadata: &format}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := node.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{
@@ -367,7 +387,8 @@ func TestAzuriteKeepsBlobAndFileNames(t *testing.T) {
 	node, control := serveIntegrationPlugin(t, map[string]blobstore.Store{containerName: azure}, root)
 	ctx := context.Background()
 
-	if err := azureLimits.upload(ctx, azure, "integration/src/../victim/file", bytesSource([]byte("payload"), int64(len("payload"))), ""); err != nil {
+	format := sparseFormatV1
+	if err := azureLimits.upload(ctx, azure, "integration/src/../victim/file", bytesSource([]byte("payload"), int64(len("payload"))), "", map[string]*string{formatMetadata: &format}); err != nil {
 		t.Fatal(err)
 	}
 	if names, err := azure.List(ctx, "integration/src/"); err != nil || len(names) != 1 || names[0] != "integration/src/../victim/file" {
@@ -539,7 +560,8 @@ func TestAzuriteStreamsLargeBlocks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(source, "memory.img"), patterned(streamedSize), 0o600); err != nil {
+	// The file encodes to exactly streamedSize bytes.
+	if err := os.WriteFile(filepath.Join(source, "memory.img"), patterned(streamedSize-denseHeaderSizeV1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	committedBlocks := func(name string) []int64 {
