@@ -177,7 +177,7 @@ func TestAzureStore(t *testing.T) {
 	if err := store.StageBlock(ctx, "prefix/file", blockID, bytes.NewReader(data), sum[:]); err != nil {
 		t.Fatalf("StageBlock: %v", err)
 	}
-	if err := store.CommitBlockList(ctx, "prefix/file", []string{blockID}, map[string]*string{"substrate_sha256": &digest}); err != nil {
+	if err := store.CommitBlockList(ctx, "prefix/file", []string{blockID}, map[string]string{"substrate_sha256": digest}); err != nil {
 		t.Fatalf("CommitBlockList: %v", err)
 	}
 	download, err := store.Download(ctx, "prefix/file")
@@ -197,7 +197,7 @@ func TestAzureStore(t *testing.T) {
 	if download.Size != int64(len(data)) {
 		t.Fatalf("download size = %d, want %d", download.Size, len(data))
 	}
-	if value := download.Metadata["Substrate_sha256"]; value == nil || *value != digest {
+	if value := download.Metadata["substrate_sha256"]; value != digest {
 		t.Fatalf("metadata = %v, want digest %q", download.Metadata, digest)
 	}
 	ranged, err := store.DownloadRange(ctx, "prefix/file", 2, 4)

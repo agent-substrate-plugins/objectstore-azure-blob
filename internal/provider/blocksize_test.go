@@ -266,7 +266,7 @@ func TestCopySnapshotSizesBlocksFromSource(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
 		data:     data,
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	server, err := New(map[string]blobstore.Store{"snapshots": store}, "tenant", t.TempDir())
 	if err != nil {
@@ -492,11 +492,11 @@ func (s *streamStore) StageBlock(ctx context.Context, _, blockID string, body io
 	return nil
 }
 
-func (s *streamStore) CommitBlockList(_ context.Context, name string, blockIDs []string, metadata map[string]*string) error {
+func (s *streamStore) CommitBlockList(_ context.Context, name string, blockIDs []string, metadata map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ids = blockIDs
-	s.digest[name] = *metadata[integrityMetadata]
+	s.digest[name] = metadata[integrityMetadata]
 	return nil
 }
 
@@ -508,7 +508,7 @@ func (s *streamStore) Download(_ context.Context, name string) (blobstore.Downlo
 	return blobstore.Download{
 		Body:     io.NopCloser(bytes.NewReader(data)),
 		Size:     int64(len(data)),
-		Metadata: map[string]*string{integrityMetadata: &digest},
+		Metadata: map[string]string{integrityMetadata: digest},
 	}, nil
 }
 

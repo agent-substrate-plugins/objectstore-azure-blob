@@ -595,7 +595,7 @@ func (s *testStore) StageBlock(context.Context, string, string, io.ReadSeeker, [
 	return nil
 }
 
-func (s *testStore) CommitBlockList(context.Context, string, []string, map[string]*string) error {
+func (s *testStore) CommitBlockList(context.Context, string, []string, map[string]string) error {
 	return nil
 }
 

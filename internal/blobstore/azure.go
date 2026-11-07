@@ -155,8 +155,12 @@ func (a *Azure) StageBlock(ctx context.Context, name, blockID string, body io.Re
 }
 
 // CommitBlockList atomically replaces a blob with the staged block list.
-func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error {
-	_, err := a.blob(name).CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{Metadata: metadata})
+func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]string) error {
+	sdkMetadata := make(map[string]*string, len(metadata))
+	for key, value := range metadata {
+		sdkMetadata[key] = &value
+	}
+	_, err := a.blob(name).CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{Metadata: sdkMetadata})
 	return mapError(err, a.name, name)
 }
 
@@ -175,8 +179,21 @@ func (a *Azure) Download(ctx context.Context, name string) (Download, error) {
 	return Download{
 		Body:     mappedBody{ReadCloser: resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3}), container: a.name, blob: name},
 		Size:     size,
-		Metadata: resp.Metadata,
+		Metadata: lowerKeys(resp.Metadata),
 	}, nil
+}
+
+// lowerKeys returns metadata with lower-case names. Azure matches metadata
+// names without regard to case, and the SDK returns them as net/http
+// canonicalized the headers that carried them, such as Substrate_sha256.
+func lowerKeys(metadata map[string]*string) map[string]string {
+	lowered := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if value != nil {
+			lowered[strings.ToLower(key)] = *value
+		}
+	}
+	return lowered
 }
 
 // DownloadRange opens count bytes of a blob from offset. Like Download, its
