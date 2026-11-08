@@ -6,6 +6,9 @@
 # Test artifacts (JUnit XML, gotestsum JSON)
 /_artifacts/
 
+# Release outputs (make install-asset)
+/_output/
+
 # Developers can store local stuff in dirs named __something
 __*
 
