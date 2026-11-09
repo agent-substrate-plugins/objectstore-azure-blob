@@ -20,10 +20,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"go.ate.dev/substrate/api/objectstore/v1"
@@ -123,7 +126,7 @@ func TestFetchSnapshotRejectsMalformedBlobs(t *testing.T) {
 		{"more frames than the blob holds", sparseBlob(patch(24, u64(1000)))},
 		{"frame offset overflows", sparseBlob(patch(32, u64(math.MaxUint64)))},
 		{"frame length overflows", sparseBlob(patch(40, u64(math.MaxUint64)))},
-		{"empty frame", sparseBlob(encodeFramesV1(logical, frame{off: 2}, frame{off: 4, data: "a"}))},
+		{"empty frame", sparseBlob(encodeFramesV1(64, frame{off: 2}, frame{off: 4, data: strings.Repeat("a", 17)}))},
 		{"overlapping frames", sparseBlob(encodeFramesV1(logical, frame{off: 2, data: "abc"}, frame{off: 4, data: "d"}))},
 		{"unsorted frames", sparseBlob(encodeFramesV1(logical, frame{off: 6, data: "a"}, frame{off: 2, data: "b"}))},
 		{"frame past the file", sparseBlob(encodeFramesV1(logical, frame{off: 8, data: "abc"}))},
@@ -174,4 +177,88 @@ func TestFetchSnapshotRejectsMalformedBlobs(t *testing.T) {
 			t.Fatalf("restored %q (err %v), want %q", got, err, want)
 		}
 	})
+}
+
+// encodedTestFile writes a 16 KiB file and returns it, its bytes, and the
+// encoding of the extents listed, which include ones at both ends of the file.
+func encodedTestFile(t *testing.T) (*os.File, []byte, *sparseFileV1, []byte) {
+	t.Helper()
+	data := make([]byte, 16<<10)
+	for i := range data {
+		data[i] = byte(i*7 + 1)
+	}
+	path := filepath.Join(t.TempDir(), "memory.img")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.Close() })
+	exts := []extent{{0, 1}, {100, 50}, {4096, 1}, {9000, 300}, {int64(len(data)) - 1, 1}}
+	frames := make([]frame, len(exts))
+	for i, e := range exts {
+		frames[i] = frame{off: e.off, data: string(data[e.off : e.off+e.length])}
+	}
+	return file, data, encodeExtentsV1(file, int64(len(data)), exts), encodeFramesV1(int64(len(data)), frames...)
+}
+
+// TestSparseFileV1ReadAt reads the encoding at every offset with lengths that
+// start and end inside the fixed header, frame headers and frame data, and
+// compares each read with the encoding built frame by frame.
+func TestSparseFileV1ReadAt(t *testing.T) {
+	_, _, enc, want := encodedTestFile(t)
+	if enc.size != int64(len(want)) {
+		t.Fatalf("encoding size = %d, want %d", enc.size, len(want))
+	}
+	for off := range len(want) + 1 {
+		for _, n := range []int{1, 5, 16, 17, 40} {
+			p := make([]byte, n)
+			got, err := enc.ReadAt(p, int64(off))
+			wantN := min(n, len(want)-off)
+			if got != wantN || !bytes.Equal(p[:got], want[off:off+wantN]) {
+				t.Fatalf("ReadAt(%d bytes at %d) = %d bytes %x, want %x", n, off, got, p[:got], want[off:off+wantN])
+			}
+			if wantN < n && err != io.EOF {
+				t.Fatalf("ReadAt(%d bytes at %d) past the end: err = %v, want io.EOF", n, off, err)
+			}
+			if wantN == n && err != nil {
+				t.Fatalf("ReadAt(%d bytes at %d): %v", n, off, err)
+			}
+		}
+	}
+}
+
+// TestSparseFileV1ReadAtShrunkFile checks that reading the encoding of a file
+// that shrank after it was mapped fails, rather than ending early: an upload
+// would otherwise commit the short encoding with a matching digest.
+func TestSparseFileV1ReadAtShrunkFile(t *testing.T) {
+	file, _, enc, _ := encodedTestFile(t)
+	if err := os.Truncate(file.Name(), 5000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(io.NewSectionReader(enc, 0, enc.size)); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("reading the encoding of a shrunk file = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+// TestDecodeSparseV1RejectsFramesBeyondBlob checks that a header claiming
+// more frames than the blob's reported size can hold fails before the decoder
+// sizes the file or reads any frame.
+func TestDecodeSparseV1RejectsFramesBeyondBlob(t *testing.T) {
+	header := sparseHeaderV1(64, 3)
+	readPastHeader := errors.New("read past the header")
+	dst, err := os.Create(filepath.Join(t.TempDir(), "restore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	err = decodeSparseV1(dst, io.MultiReader(bytes.NewReader(header[:]), &errReader{err: readPastHeader}), sparseFixedHeaderV1+sparseFrameHeaderV1)
+	if !errors.Is(err, errIntegrity) || errors.Is(err, readPastHeader) {
+		t.Fatalf("decodeSparseV1 = %v, want an integrity failure before reading a frame", err)
+	}
+	if info, err := dst.Stat(); err != nil || info.Size() != 0 {
+		t.Fatalf("decodeSparseV1 sized the file (%v, %v), want it untouched", info, err)
+	}
 }

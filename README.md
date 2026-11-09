@@ -32,8 +32,8 @@ reads as zero without being allocated, and renames the file into place once
 its digest matches. A restore holds one frame's position at a time, however
 many frames a blob claims. The blob's `substrate_format` metadata is
 `sparse-v1`; a fetch refuses a blob without it or with a format it does not
-know. `CopySnapshot` copies the blob and its metadata without decoding it, and
-refuses a blob without format metadata.
+know. `CopySnapshot` copies the blob and its format and digest metadata without
+decoding it, and refuses a blob without format metadata.
 
 The digest covers the blob, not the restored file, so a file system that
 reports data as a hole would upload zeros in its place undetected. The plugin

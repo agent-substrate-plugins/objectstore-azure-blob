@@ -138,13 +138,19 @@ func newSparseFileV1(file *os.File, logicalSize int64) (*sparseFileV1, error) {
 	if info.Size() != logicalSize {
 		return nil, fmt.Errorf("file changed from %d to %d bytes while its holes were mapped", logicalSize, info.Size())
 	}
+	return encodeExtentsV1(file, logicalSize, exts), nil
+}
+
+// encodeExtentsV1 returns the encoding of file, which is logicalSize bytes
+// long and populated at exts.
+func encodeExtentsV1(file *os.File, logicalSize int64, exts []extent) *sparseFileV1 {
 	starts := make([]int64, len(exts))
 	size := int64(sparseFixedHeaderV1)
 	for i, e := range exts {
 		starts[i] = size
 		size += sparseFrameHeaderV1 + e.length
 	}
-	return &sparseFileV1{file: file, header: sparseHeaderV1(logicalSize, len(exts)), exts: exts, starts: starts, size: size}, nil
+	return &sparseFileV1{file: file, header: sparseHeaderV1(logicalSize, len(exts)), exts: exts, starts: starts, size: size}
 }
 
 func (s *sparseFileV1) ReadAt(p []byte, off int64) (int, error) {
