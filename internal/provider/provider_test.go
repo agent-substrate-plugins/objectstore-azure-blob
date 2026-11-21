@@ -323,7 +323,7 @@ func TestUploadSnapshotPartialRetry(t *testing.T) {
 		t.Fatalf("retried UploadSnapshot: %v", err)
 	}
 	blob := store.blobs["tenant/actors/a/snapshots/one/memory.img"]
-	if !bytes.Equal(blob.data, want) {
+	if !bytes.Equal(blob.data, denseEncodingV1(want)) {
 		t.Fatalf("committed bytes differ after retry")
 	}
 }
@@ -360,7 +360,8 @@ func TestUploadSnapshotStagesBlocksConcurrently(t *testing.T) {
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "memory.img"), make([]byte, 2*minBlockSize), 0o600); err != nil {
+	// Not zeros: a compressing file system would store them as a hole.
+	if err := os.WriteFile(filepath.Join(source, "memory.img"), bytes.Repeat([]byte("x"), 2*minBlockSize), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	release := make(chan struct{})
@@ -416,11 +417,21 @@ func TestUploadSnapshotEmptyFile(t *testing.T) {
 		t.Fatalf("UploadSnapshot: %v", err)
 	}
 	blob := store.blobs["tenant/actors/a/snapshots/one/empty"]
-	if len(blob.data) != 0 {
-		t.Fatalf("empty blob contains %d bytes", len(blob.data))
+	if !bytes.Equal(blob.data, denseEncodingV1(nil)) {
+		t.Fatalf("empty blob holds %d bytes, want only the %d byte header", len(blob.data), sparseFixedHeaderV1)
 	}
 	if _, err := metadataHash(blob.metadata); err != nil {
 		t.Fatalf("empty blob integrity metadata: %v", err)
+	}
+	dest := filepath.Join(root, "dest")
+	if err := os.Mkdir(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{SnapshotUri: testURI, WritePath: dest, Files: []string{"empty"}}); err != nil {
+		t.Fatalf("FetchSnapshot: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(dest, "empty")); err != nil || info.Size() != 0 {
+		t.Fatalf("restored empty file: %v, %v", info, err)
 	}
 }
 
@@ -436,12 +447,9 @@ func TestFetchSnapshotErrors(t *testing.T) {
 	if _, err := server.FetchSnapshot(context.Background(), req); status.Code(err) != codes.NotFound {
 		t.Fatalf("missing FetchSnapshot code = %v, want NotFound", status.Code(err))
 	}
-	sum := sha256.Sum256([]byte("good"))
-	digest := hex.EncodeToString(sum[:])
-	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
-		data:     []byte("corrupt"),
-		metadata: map[string]*string{integrityMetadata: &digest},
-	}
+	corrupt := sparseBlob(denseEncodingV1([]byte("good")))
+	corrupt.data = denseEncodingV1([]byte("bad!"))
+	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = corrupt
 	if _, err := server.FetchSnapshot(context.Background(), req); status.Code(err) != codes.DataLoss {
 		t.Fatalf("corrupt FetchSnapshot code = %v, want DataLoss: %v", status.Code(err), err)
 	}
@@ -450,7 +458,7 @@ func TestFetchSnapshotErrors(t *testing.T) {
 	}
 
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
-		data:     []byte("good"),
+		data:     denseEncodingV1([]byte("good")),
 		metadata: map[string]*string{},
 	}
 	if _, err := server.FetchSnapshot(context.Background(), req); status.Code(err) != codes.DataLoss {
@@ -510,7 +518,7 @@ func TestCopySnapshot(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	req := &objectstore.CopySnapshotRequest{
@@ -539,7 +547,7 @@ func TestCopySnapshot(t *testing.T) {
 	badDigest := strings.Repeat("0", sha256.Size*2)
 	store.blobs["tenant/actors/a/snapshots/corrupt/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &badDigest},
+		metadata: map[string]*string{integrityMetadata: &badDigest, formatMetadata: &testFormat},
 	}
 	_, err = server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
 		SrcUri: "azblob://snapshots/actors/a/snapshots/corrupt",
@@ -551,6 +559,34 @@ func TestCopySnapshot(t *testing.T) {
 	if _, ok := store.blobs["tenant/tags/corrupt/manifest.json"]; ok {
 		t.Fatal("CopySnapshot committed bytes that failed integrity verification")
 	}
+
+	unformatted := sparseBlob([]byte("manifest"))
+	delete(unformatted.metadata, formatMetadata)
+	store.blobs["tenant/actors/a/snapshots/raw/manifest.json"] = unformatted
+	_, err = server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
+		SrcUri: "azblob://snapshots/actors/a/snapshots/raw",
+		DstUri: "azblob://snapshots/tags/raw",
+	})
+	if status.Code(err) != codes.DataLoss {
+		t.Fatalf("CopySnapshot of a blob without format metadata code = %v, want DataLoss", status.Code(err))
+	}
+	if _, ok := store.blobs["tenant/tags/raw/manifest.json"]; ok {
+		t.Fatal("CopySnapshot committed a blob no fetch could decode")
+	}
+
+	future := sparseBlob([]byte("future encoding"))
+	other := "sparse-v2"
+	future.metadata[formatMetadata] = &other
+	store.blobs["tenant/actors/a/snapshots/future/memory.img"] = future
+	if _, err := server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
+		SrcUri: "azblob://snapshots/actors/a/snapshots/future",
+		DstUri: "azblob://snapshots/tags/future",
+	}); err != nil {
+		t.Fatalf("CopySnapshot of a format this build cannot decode: %v", err)
+	}
+	if got, _ := metadataValue(store.blobs["tenant/tags/future/memory.img"].metadata, formatMetadata); got != other {
+		t.Fatalf("copied format metadata = %q, want %q", got, other)
+	}
 }
 
 func TestCopySnapshotKeepsListedSuffix(t *testing.T) {
@@ -560,7 +596,7 @@ func TestCopySnapshotKeepsListedSuffix(t *testing.T) {
 	// Blob names are flat, so a listed name may hold a ".." segment.
 	store.blobs["tenant/actors/a/snapshots/one/../victim/file"] = fakeBlob{
 		data:     []byte("payload"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	if _, err := server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
@@ -624,7 +660,7 @@ func TestCopySnapshotAcrossContainers(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	src.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}
 	server, err := New(map[string]blobstore.Store{"snapshots": src, "tags": dst}, "tenant", t.TempDir())
 	if err != nil {
@@ -653,13 +689,9 @@ func TestStreamingReadErrorsKeepTheirCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newFakeStore()
-	sum := sha256.Sum256([]byte("manifest"))
-	digest := hex.EncodeToString(sum[:])
-	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
-		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
-	}
-	store.readErr = fmt.Errorf("%w: connection reset", blobstore.ErrUnavailable)
+	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = sparseBlob(denseEncodingV1([]byte("manifest")))
+	// The Azure body reports a connection dropped mid-header this way.
+	store.readErr = fmt.Errorf("%w: %w", blobstore.ErrUnavailable, io.ErrUnexpectedEOF)
 	server := newTestServer(t, store, root)
 
 	_, err := server.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{
@@ -688,7 +720,7 @@ func TestCopySnapshotPartialRetry(t *testing.T) {
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
-		data: data, metadata: map[string]*string{integrityMetadata: &digest},
+		data: data, metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	req := &objectstore.CopySnapshotRequest{SrcUri: testURI, DstUri: "azblob://snapshots/tags/stable"}
@@ -951,11 +983,7 @@ func TestRejectsSymlinksOutsideRoot(t *testing.T) {
 	}); err == nil {
 		t.Fatal("UploadSnapshot read through a directory symlink")
 	}
-	sum := sha256.Sum256([]byte("replacement"))
-	digest := hex.EncodeToString(sum[:])
-	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
-		data: []byte("replacement"), metadata: map[string]*string{integrityMetadata: &digest},
-	}
+	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = sparseBlob(denseEncodingV1([]byte("replacement")))
 	if _, err := server.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{
 		SnapshotUri: testURI, WritePath: link, Files: []string{"memory.img"},
 	}); err == nil {

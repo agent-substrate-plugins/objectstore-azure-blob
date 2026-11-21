@@ -141,8 +141,8 @@ func New(stores map[string]blobstore.Store, prefix, root string) (*Server, error
 	return &Server{stores: maps.Clone(stores), prefix: prefix, root: filepath.Clean(root), limits: azureLimits}, nil
 }
 
-// FetchSnapshot downloads and verifies every requested file before atomically
-// replacing its destination.
+// FetchSnapshot downloads, decodes and verifies every requested file before
+// atomically replacing its destination.
 func (s *Server) FetchSnapshot(ctx context.Context, req *objectstore.FetchSnapshotRequest) (*objectstore.FetchSnapshotResponse, error) {
 	loc, dir, err := s.validateNodeRequest(req.GetSnapshotUri(), req.GetWritePath(), req.GetFiles())
 	if err != nil {
@@ -162,8 +162,8 @@ func (s *Server) FetchSnapshot(ctx context.Context, req *objectstore.FetchSnapsh
 	return &objectstore.FetchSnapshotResponse{}, nil
 }
 
-// UploadSnapshot stages deterministic blocks and commits each blob only after
-// all of its bytes are durably staged.
+// UploadSnapshot stages each file's sparse encoding in deterministic blocks
+// and commits each blob only after all of its bytes are durably staged.
 func (s *Server) UploadSnapshot(ctx context.Context, req *objectstore.UploadSnapshotRequest) (*objectstore.UploadSnapshotResponse, error) {
 	loc, dir, err := s.validateNodeRequest(req.GetSnapshotUri(), req.GetLocalPath(), req.GetFiles())
 	if err != nil {
@@ -175,10 +175,10 @@ func (s *Server) UploadSnapshot(ctx context.Context, req *objectstore.UploadSnap
 	}
 	defer root.Close()
 
-	// Open and size every file before staging any block, so a request
+	// Open and encode every file before staging any block, so a request
 	// holding a file too large for one blob fails before it transfers data.
 	files := make([]*os.File, len(req.GetFiles()))
-	sizes := make([]int64, len(files))
+	encoded := make([]*sparseFileV1, len(files))
 	defer func() {
 		for _, local := range files {
 			if local != nil {
@@ -199,13 +199,19 @@ func (s *Server) UploadSnapshot(ctx context.Context, req *objectstore.UploadSnap
 		if !info.Mode().IsRegular() {
 			return nil, status.Errorf(codes.InvalidArgument, "snapshot file %q is not a regular file", name)
 		}
-		if _, err := s.limits.blockSize(info.Size()); err != nil {
-			return nil, toStatus(fmt.Errorf("snapshot file %q: %w", name, err))
+		enc, err := newSparseFileV1(local, info.Size())
+		if err != nil {
+			return nil, toStatus(fmt.Errorf("mapping snapshot file %q: %w", name, err))
 		}
-		sizes[i] = info.Size()
+		if _, err := s.limits.blockSize(enc.size); err != nil {
+			return nil, toStatus(fmt.Errorf("snapshot file %q encoding: %w", name, err))
+		}
+		encoded[i] = enc
 	}
+	format := sparseFormatV1
+	metadata := map[string]*string{formatMetadata: &format}
 	for i, name := range req.GetFiles() {
-		uploadErr := s.limits.upload(ctx, loc.store, path.Join(loc.prefix, name), fileSource(files[i], sizes[i]), "")
+		uploadErr := s.limits.upload(ctx, loc.store, path.Join(loc.prefix, name), readerAtSource(encoded[i], encoded[i].size), "", metadata)
 		closeErr := files[i].Close()
 		files[i] = nil
 		if err := errors.Join(uploadErr, closeErr); err != nil {
@@ -246,8 +252,9 @@ func isAbsent(err error) bool {
 	return errors.Is(err, blobstore.ErrNotFound) || errors.Is(err, blobstore.ErrContainerNotFound)
 }
 
-// CopySnapshot copies and re-verifies every committed source blob. Source and
-// destination may be in different configured containers.
+// CopySnapshot copies and re-verifies every committed source blob, with its
+// format metadata, without decoding it. Source and destination may be in
+// different configured containers.
 func (s *Server) CopySnapshot(ctx context.Context, req *objectstore.CopySnapshotRequest) (*objectstore.CopySnapshotResponse, error) {
 	src, err := s.parseURI(req.GetSrcUri())
 	if err != nil {
@@ -286,16 +293,25 @@ func fetchFile(ctx context.Context, store blobstore.Store, root *os.Root, blobNa
 		return err
 	}
 	defer download.Body.Close()
+	decode, err := decoderFor(download.Metadata)
+	if err != nil {
+		return err
+	}
 
+	// The temporary file is new and empty, so the holes the decode leaves
+	// read as zeros rather than as an earlier file's bytes.
 	tempName, temp, err := createTemp(root)
 	if err != nil {
 		return fmt.Errorf("opening temporary restore file: %w", err)
 	}
 	hash := sha256.New()
-	_, copyErr := io.Copy(io.MultiWriter(temp, hash), download.Body)
-	syncErr := temp.Sync()
+	decodeErr := decode(temp, io.TeeReader(download.Body, hash), download.Size)
+	var syncErr error
+	if decodeErr == nil {
+		syncErr = temp.Sync()
+	}
 	closeErr := temp.Close()
-	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+	if err := errors.Join(decodeErr, syncErr, closeErr); err != nil {
 		_ = root.Remove(tempName)
 		return fmt.Errorf("writing restore file: %w", err)
 	}
@@ -369,15 +385,15 @@ type blockSource struct {
 	buffer bool
 }
 
-// fileSource returns the first size bytes of file as a blockSource that reads
-// each block from the file twice, once to hash it and once to stage it, so an
-// upload holds no file data in memory.
-func fileSource(file *os.File, size int64) blockSource {
+// readerAtSource returns the first size bytes of r as a blockSource that reads
+// each block twice, once to hash it and once to stage it, so an upload holds
+// no block data in memory.
+func readerAtSource(r io.ReaderAt, size int64) blockSource {
 	return blockSource{
-		r:    io.NewSectionReader(file, 0, size),
+		r:    io.NewSectionReader(r, 0, size),
 		size: size,
 		reread: func(_ context.Context, off, n int64) io.ReadSeekCloser {
-			return nopCloser{io.NewSectionReader(file, off, n)}
+			return nopCloser{io.NewSectionReader(r, off, n)}
 		},
 	}
 }
@@ -392,8 +408,9 @@ func (nopCloser) Close() error { return nil }
 // hashBufferSize buffer. If src.buffer is set and a block fits in
 // bufferBudget, it instead stages each block from the bytes it hashed,
 // holding at most bufferBudget bytes of blocks at once. A non-empty
-// expectedHash must match the SHA-256 of the bytes read from src.r.
-func (l blockLimits) upload(ctx context.Context, store blobstore.Store, blobName string, src blockSource, expectedHash string) error {
+// expectedHash must match the SHA-256 of the bytes read from src.r. The blob
+// commits with metadata and that SHA-256.
+func (l blockLimits) upload(ctx context.Context, store blobstore.Store, blobName string, src blockSource, expectedHash string, metadata map[string]*string) error {
 	blockSize, err := l.blockSize(src.size)
 	if err != nil {
 		return err
@@ -448,7 +465,9 @@ func (l blockLimits) upload(ctx context.Context, store blobstore.Store, blobName
 		if buffered {
 			buf := make([]byte, blockSize)
 			read, err := io.ReadFull(src.r, buf)
-			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			// Only an unwrapped EOF ends the source; the Azure body
+			// reports a dropped connection as an error wrapping one.
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 				return abort(err)
 			}
 			n = int64(read)
@@ -500,19 +519,32 @@ func (l blockLimits) upload(ctx context.Context, store blobstore.Store, blobName
 	if expectedHash != "" && digest != expectedHash {
 		return fmt.Errorf("%w: source blob got sha256 %s, want %s", errIntegrity, digest, expectedHash)
 	}
-	return store.CommitBlockList(ctx, blobName, blockIDs, map[string]*string{integrityMetadata: &digest})
+	committed := maps.Clone(metadata)
+	if committed == nil {
+		committed = map[string]*string{}
+	}
+	committed[integrityMetadata] = &digest
+	return store.CommitBlockList(ctx, blobName, blockIDs, committed)
 }
 
 // uploadVerified commits download, the body of blob srcName in srcStore, as
 // blobName in store, and fails unless its bytes match the SHA-256 in the
-// download's metadata. Blocks larger than bufferBudget are staged from
-// ranged downloads of the source, so a copy of any size holds at most
-// bufferBudget bytes of blocks.
+// download's metadata. The copy keeps the source's format metadata, so it
+// decodes like the source, and fails if the source has none: a copy of any
+// format, including one this build cannot decode, needs only its bytes and
+// metadata. Blocks larger than bufferBudget are staged from ranged downloads
+// of the source, so a copy of any size holds at most bufferBudget bytes of
+// blocks.
 func (l blockLimits) uploadVerified(ctx context.Context, store blobstore.Store, blobName string, srcStore blobstore.Store, srcName string, download blobstore.Download) error {
 	want, err := metadataHash(download.Metadata)
 	if err != nil {
 		return err
 	}
+	format, ok := metadataValue(download.Metadata, formatMetadata)
+	if !ok {
+		return fmt.Errorf("%w: blob has no snapshot format metadata", errIntegrity)
+	}
+	metadata := map[string]*string{formatMetadata: &format}
 	return l.upload(ctx, store, blobName, blockSource{
 		r:      download.Body,
 		size:   download.Size,
@@ -520,7 +552,7 @@ func (l blockLimits) uploadVerified(ctx context.Context, store blobstore.Store, 
 		reread: func(ctx context.Context, off, n int64) io.ReadSeekCloser {
 			return &rangeBody{ctx: ctx, store: srcStore, name: srcName, off: off, n: n}
 		},
-	}, want)
+	}, want, metadata)
 }
 
 // rangeBody reads bytes [off, off+n) of a blob. It opens a ranged download at
@@ -554,7 +586,9 @@ func (r *rangeBody) Read(p []byte) (int, error) {
 	}
 	read, err := r.body.Read(p)
 	r.pos += int64(read)
-	if errors.Is(err, io.EOF) && r.pos < r.n {
+	// Only an unwrapped EOF ends the range early; a wrapped one is a failed
+	// read that keeps its code.
+	if err == io.EOF && r.pos < r.n {
 		return read, fmt.Errorf("blob %q ended %d bytes into a %d byte range: %w", r.name, r.pos, r.n, io.ErrUnexpectedEOF)
 	}
 	return read, err
@@ -606,15 +640,25 @@ func verifyHash(metadata map[string]*string, sum []byte) error {
 }
 
 func metadataHash(metadata map[string]*string) (string, error) {
-	for key, value := range metadata {
-		if strings.EqualFold(key, integrityMetadata) && value != nil {
-			if len(*value) != sha256.Size*2 {
-				return "", fmt.Errorf("%w: blob has invalid SHA-256 metadata", errIntegrity)
-			}
-			return strings.ToLower(*value), nil
+	value, ok := metadataValue(metadata, integrityMetadata)
+	if !ok {
+		return "", fmt.Errorf("%w: blob has no SHA-256 metadata", errIntegrity)
+	}
+	if len(value) != sha256.Size*2 {
+		return "", fmt.Errorf("%w: blob has invalid SHA-256 metadata", errIntegrity)
+	}
+	return strings.ToLower(value), nil
+}
+
+// metadataValue returns the value of key in metadata. Azure metadata names
+// are case-insensitive, and the service may return them in another case.
+func metadataValue(metadata map[string]*string, key string) (string, bool) {
+	for name, value := range metadata {
+		if strings.EqualFold(name, key) && value != nil {
+			return *value, true
 		}
 	}
-	return "", fmt.Errorf("%w: blob has no SHA-256 metadata", errIntegrity)
+	return "", false
 }
 
 func (s *Server) validateNodeRequest(snapshotURI, dir string, files []string) (location, string, error) {

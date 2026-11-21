@@ -126,7 +126,7 @@ func TestBufferSlotsBoundMemory(t *testing.T) {
 }
 
 // bytesSource returns data as a blockSource that rereads it, the way
-// fileSource rereads a file.
+// readerAtSource rereads a file's encoding.
 func bytesSource(data []byte, size int64) blockSource {
 	return blockSource{
 		r:    bytes.NewReader(data),
@@ -175,7 +175,8 @@ func (s *sizeRecordingStore) StageBlock(ctx context.Context, name, blockID strin
 
 // TestUploadSnapshotBlockSizeBoundaries runs UploadSnapshot at each boundary
 // of the block size, with limits scaled down to two blocks of at most 6 MiB
-// so the files stay small.
+// so the files stay small. The sizes are of the blob: a file without holes
+// encodes to its bytes after a denseHeaderSizeV1 header.
 func TestUploadSnapshotBlockSizeBoundaries(t *testing.T) {
 	limits := blockLimits{maxBlocks: 2, maxBlockSize: 6 * mib}
 	for _, tc := range []struct {
@@ -193,7 +194,7 @@ func TestUploadSnapshotBlockSizeBoundaries(t *testing.T) {
 			if err := os.Mkdir(source, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			want := bytes.Repeat([]byte("abcdefg"), int(tc.size/7)+1)[:tc.size]
+			want := bytes.Repeat([]byte("abcdefg"), int(tc.size/7)+1)[:tc.size-denseHeaderSizeV1]
 			if err := os.WriteFile(filepath.Join(source, "memory.img"), want, 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -215,15 +216,16 @@ func TestUploadSnapshotBlockSizeBoundaries(t *testing.T) {
 					t.Errorf("block %d holds %d bytes, want %d", index, store.blocks[index], size)
 				}
 			}
-			if blob := store.blobs["tenant/actors/a/snapshots/one/memory.img"]; !bytes.Equal(blob.data, want) {
-				t.Fatal("committed bytes differ from the file")
+			if blob := store.blobs["tenant/actors/a/snapshots/one/memory.img"]; !bytes.Equal(blob.data, denseEncodingV1(want)) {
+				t.Fatal("committed bytes differ from the file's encoding")
 			}
 		})
 	}
 }
 
-// TestUploadSnapshotRefusesTooLargeFileBeforeTransfer checks that a file over
-// the limit fails the request before any file in it is staged.
+// TestUploadSnapshotRefusesTooLargeFileBeforeTransfer checks that a file
+// whose encoding is over the limit fails the request before any file in it is
+// staged.
 func TestUploadSnapshotRefusesTooLargeFileBeforeTransfer(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -233,11 +235,8 @@ func TestUploadSnapshotRefusesTooLargeFileBeforeTransfer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "small"), []byte("small"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	large, err := os.Create(filepath.Join(source, "memory.img"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := errors.Join(large.Truncate(12*mib+1), large.Close()); err != nil {
+	const encodedSize = 12*mib + 1
+	if err := os.WriteFile(filepath.Join(source, "memory.img"), bytes.Repeat([]byte("x"), encodedSize-denseHeaderSizeV1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := newFakeStore()
@@ -245,12 +244,12 @@ func TestUploadSnapshotRefusesTooLargeFileBeforeTransfer(t *testing.T) {
 	server.limits = blockLimits{maxBlocks: 2, maxBlockSize: 6 * mib}
 	req := &objectstore.UploadSnapshotRequest{SnapshotUri: testURI, LocalPath: source, Files: []string{"small", "memory.img"}}
 
-	_, err = server.UploadSnapshot(context.Background(), req)
+	_, err := server.UploadSnapshot(context.Background(), req)
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("UploadSnapshot code = %v, want InvalidArgument: %v", status.Code(err), err)
 	}
-	if !strings.Contains(err.Error(), `"memory.img"`) || !strings.Contains(err.Error(), strconv.Itoa(12*mib+1)) {
-		t.Errorf("error %q does not name the file and its size", err)
+	if !strings.Contains(err.Error(), `"memory.img"`) || !strings.Contains(err.Error(), strconv.Itoa(encodedSize)) {
+		t.Errorf("error %q does not name the file and its encoded size", err)
 	}
 	if store.stageCalls != 0 || len(store.blobs) != 0 {
 		t.Fatalf("staged %d blocks and committed %d blobs, want none", store.stageCalls, len(store.blobs))
@@ -266,7 +265,7 @@ func TestCopySnapshotSizesBlocksFromSource(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
 		data:     data,
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}
 	server, err := New(map[string]blobstore.Store{"snapshots": store}, "tenant", t.TempDir())
 	if err != nil {
@@ -295,7 +294,7 @@ func TestUploadRefusesUnknownSizeSourceOverBlockLimit(t *testing.T) {
 			store := newFakeStore()
 			src := bytesSource(make([]byte, 8*mib+1), -1)
 			src.buffer = buffer
-			if err := limits.upload(context.Background(), store, "blob", src, ""); !errors.Is(err, errTooLarge) {
+			if err := limits.upload(context.Background(), store, "blob", src, "", nil); !errors.Is(err, errTooLarge) {
 				t.Fatalf("upload = %v, want errTooLarge", err)
 			}
 			if len(store.blobs) != 0 {
@@ -303,7 +302,7 @@ func TestUploadRefusesUnknownSizeSourceOverBlockLimit(t *testing.T) {
 			}
 			src = bytesSource(make([]byte, 8*mib), -1)
 			src.buffer = buffer
-			if err := limits.upload(context.Background(), store, "blob", src, ""); err != nil {
+			if err := limits.upload(context.Background(), store, "blob", src, "", nil); err != nil {
 				t.Fatalf("upload of two minimum blocks: %v", err)
 			}
 		})
@@ -392,7 +391,7 @@ func TestUploadHoldsAtMostBufferBudget(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				done <- tc.limits.upload(context.Background(), store, "blob", source, "")
+				done <- tc.limits.upload(context.Background(), store, "blob", source, "", nil)
 			}()
 			// Hold every slot's stage open, then give the reader time to
 			// read past the slots if it would.
@@ -508,7 +507,7 @@ func (s *streamStore) Download(_ context.Context, name string) (blobstore.Downlo
 	return blobstore.Download{
 		Body:     io.NopCloser(bytes.NewReader(data)),
 		Size:     int64(len(data)),
-		Metadata: map[string]*string{integrityMetadata: &digest},
+		Metadata: map[string]*string{integrityMetadata: &digest, formatMetadata: &testFormat},
 	}, nil
 }
 
@@ -573,12 +572,12 @@ func TestUploadSnapshotStreamsLargeBlocks(t *testing.T) {
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	data := patterned(streamedSize)
+	// The file encodes to exactly streamedSize bytes.
+	data := patterned(streamedSize - denseHeaderSizeV1)
 	if err := os.WriteFile(filepath.Join(source, "memory.img"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256(data)
-	want := hex.EncodeToString(sum[:])
+	want := denseDigestV1(data)
 	store := newStreamStore(2)
 	server, err := New(map[string]blobstore.Store{"snapshots": store}, "tenant", root)
 	if err != nil {
@@ -736,4 +735,29 @@ func TestRangeBody(t *testing.T) {
 	if _, err := io.ReadAll(missing); !errors.Is(err, blobstore.ErrNotFound) {
 		t.Fatalf("read of a missing blob = %v, want ErrNotFound", err)
 	}
+
+	// The Azure body reports a connection that ended early as
+	// ErrUnavailable wrapping the EOF.
+	dropped := fmt.Errorf("%w: %w", blobstore.ErrUnavailable, io.EOF)
+	failing := &rangeBody{ctx: ctx, store: droppingStore{fakeStore: store, err: dropped}, name: "blob", off: 0, n: 5}
+	if _, err := io.ReadAll(failing); !errors.Is(err, blobstore.ErrUnavailable) {
+		t.Fatalf("read of a dropped range = %v, want ErrUnavailable", err)
+	}
+}
+
+// droppingStore serves one byte of each range, then fails it with err.
+type droppingStore struct {
+	*fakeStore
+	err error
+}
+
+func (s droppingStore) DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error) {
+	body, err := s.fakeStore.DownloadRange(ctx, name, offset, count)
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(io.LimitReader(body, 1), &errReader{err: s.err}), body}, nil
 }

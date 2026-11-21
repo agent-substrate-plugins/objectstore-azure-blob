@@ -9,20 +9,54 @@ substrate's public `api/` and `pkg/` packages.
 The plugin stores each requested snapshot file as one block blob. Uploads use
 deterministic staged block IDs and atomically replace the committed block list,
 so a retry after a partial upload is safe. Each blob carries a SHA-256 digest
-in metadata. Fetch and copy verify that digest before exposing or committing
-the destination bytes. Azure also verifies each staged block's MD5 in transit.
+of its bytes in metadata. Fetch and copy verify that digest before exposing or
+committing the destination bytes. Azure also verifies each staged block's MD5
+in transit.
+
+A blob holds its file in a sparse format, so a snapshot's holes, such as the
+unused guest memory in a microVM's `memory-ranges`, are neither sent to Azure
+nor written to disk on restore. The blob is a header followed by one frame per
+populated range of the file:
+
+```text
+magic "AZSPARSE" | version:u32 = 1 | flags:u32 = 0 | logical size:u64 |
+frame count:u64 | (offset:u64 | length:u64 | data) per frame
+```
+
+Integers are little-endian, and the frames are in order and do not overlap.
+`UploadSnapshot` finds a file's populated ranges with `SEEK_DATA` and
+`SEEK_HOLE`; other platforms and kernels that cannot report holes upload the
+whole file as one frame. `FetchSnapshot` writes each frame as it reads it into
+a new temporary file of the logical size, so every byte outside the frames
+reads as zero without being allocated, and renames the file into place once
+its digest matches. A restore holds one frame's position at a time, however
+many frames a blob claims. The blob's `substrate_format` metadata is
+`sparse-v1`; a fetch refuses a blob without it or with a format it does not
+know. `CopySnapshot` copies the blob and its format and digest metadata without
+decoding it, and refuses a blob without format metadata.
+
+The digest covers the blob, not the restored file, so a file system that
+reports data as a hole would upload zeros in its place undetected. The plugin
+relies on the file system reporting holes correctly, as `cp` and substrate's
+own sparse copies do.
+
+The format follows the sparse-extent format of substrate's in-tree object
+storage
+([`pkg/objectstorage/sparsezstd.go`](https://github.com/agent-substrate/substrate/blob/v1.0.0/pkg/objectstorage/sparsezstd.go)),
+which also uploads only populated ranges as `(offset, length, data)` frames and
+restores them into a file truncated to its logical size. It is not compatible
+with it: these blobs are uncompressed, start with their own magic, and are
+chosen by `substrate_format` metadata rather than by their first bytes. Each
+plugin's storage format is private to it, as the snapshot API allows.
 
 ## Compatibility
 
-The plugin needs a substrate that serves the `substrate.objectstore.v1` proto
-package, introduced by
-[agent-substrate/substrate@48f5744](https://github.com/agent-substrate/substrate/commit/48f5744c1dde5ffa63e926f5b4d037065f109965).
-As of 2026-10-28, no substrate release includes it and the `release-0.6` branch
-does not either. Releases cut from `main` after that commit will; v0.6.x patch
-releases cut from `release-0.6` will not unless the commit is cherry-picked
-there. v0.6.0 and earlier call the old `objectstore.v1` service name, so this
-plugin answers them with `Unimplemented`. `go.mod` pins the substrate version
-the plugin is built and tested against.
+The plugin needs substrate v1.0.0 or later, the first release that serves the
+`substrate.objectstore.v1` proto package (added in
+[agent-substrate/substrate@48f5744](https://github.com/agent-substrate/substrate/commit/48f5744c1dde5ffa63e926f5b4d037065f109965)).
+v0.6.x and earlier call the old `objectstore.v1` service name, so this plugin
+answers them with `Unimplemented`. `go.mod` pins the substrate version the
+plugin is built and tested against.
 
 ## Sidecars
 
@@ -298,6 +332,8 @@ Without the gate, ate-api-server ignores that field. See
 | Blob replaced while a download was resuming | `Unavailable` |
 | Context canceled or deadline exceeded | `Canceled` / `DeadlineExceeded` |
 | SHA-256 metadata absent, invalid, or mismatched | `DataLoss` |
+| Fetched blob without known format metadata, or malformed; copied blob without format metadata | `DataLoss` |
+| Fetched blob whose logical size the local file system cannot hold, such as a corrupt header that claims petabytes | `Internal` |
 | Other local or Azure failures | `Internal` |
 
 `FetchAsset` differs where its codes carry a narrower meaning:
@@ -320,16 +356,23 @@ for `gs://` URLs, which this plugin never reads.
   actor snapshot deletion until the operator removes them (`CleanupSnapshot`
   fails with `Internal`, Azure error `SnapshotsPresent`); the plugin never
   deletes them itself.
-- A file is staged in 4 MiB blocks, or, above 50,000 such blocks (about
+- A file's blob (its populated bytes, plus a 32-byte header and 16 bytes per
+  range) is staged in 4 MiB blocks, or, above 50,000 such blocks (about
   195 GiB), in blocks of its size divided by 50,000, rounded up to a whole MiB.
-  One file can therefore reach Azure's block blob limit of 50,000 blocks of
+  One blob can therefore reach Azure's block blob limit of 50,000 blocks of
   4,000 MiB (about 190.7 TiB). `UploadSnapshot` refuses a request holding a
-  larger file with `InvalidArgument` before it stages any block.
-- `UploadSnapshot` reads each block of a file twice: once to hash it, through
+  file whose blob would be larger with `InvalidArgument` before it stages any
+  block.
+- `UploadSnapshot` reads each block of a blob twice: once to hash it, through
   a 1 MiB buffer, and once, from the file, as the SDK sends it. It stages up to
   eight blocks at once and holds no block in memory, whatever the block size.
   Azure checks each block against the MD5 of the first read, so a block that
-  changes between the two reads fails the upload.
+  changes between the two reads fails the upload. The file must not change
+  during the upload: its ranges are found before any block is read, and a
+  file whose size changes while they are found fails the upload.
+- `UploadSnapshot` holds 24 bytes per populated range of each file in the
+  request until it finishes, so a file fragmented into millions of ranges
+  costs tens of MiB.
 - `CopySnapshot` holds each source block in memory until it is staged, at most
   32 MiB at once, when blocks are up to 32 MiB (blobs up to about 1.5 TiB).
   Larger blocks are staged from a second, ranged download of the source, like
