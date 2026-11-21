@@ -53,3 +53,13 @@ verify:
 .PHONY: build-image
 build-image:
 	$(KO) build $(KO_FLAGS) ./cmd/azure-blob-objectstore-plugin
+
+# Renders the release install asset, config/kustomization.yaml with the image
+# pinned by digest, from the reference `make build-image` printed, e.g.
+# make install-asset IMAGE=ghcr.io/agent-substrate-plugins/objectstore-azure-blob@sha256:...
+INSTALL_ASSET ?= _output/objectstore-azure-blob-component.yaml
+
+.PHONY: install-asset
+install-asset:
+	@if [ -z "$(IMAGE)" ]; then echo "set IMAGE=<image>@sha256:<digest>" >&2; exit 1; fi
+	./hack/render-install-asset.sh "$(IMAGE)" "$(INSTALL_ASSET)"
