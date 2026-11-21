@@ -43,7 +43,7 @@ const testURI = "azblob://snapshots/actors/a/snapshots/one"
 
 type fakeBlob struct {
 	data     []byte
-	metadata map[string]*string
+	metadata map[string]string
 }
 
 type fakeStore struct {
@@ -89,7 +89,7 @@ func (f *fakeStore) StageBlock(ctx context.Context, name, blockID string, body i
 	return nil
 }
 
-func (f *fakeStore) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error {
+func (f *fakeStore) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -440,7 +440,7 @@ func TestFetchSnapshotErrors(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("corrupt"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	if _, err := server.FetchSnapshot(context.Background(), req); status.Code(err) != codes.DataLoss {
 		t.Fatalf("corrupt FetchSnapshot code = %v, want DataLoss: %v", status.Code(err), err)
@@ -451,7 +451,7 @@ func TestFetchSnapshotErrors(t *testing.T) {
 
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("good"),
-		metadata: map[string]*string{},
+		metadata: map[string]string{},
 	}
 	if _, err := server.FetchSnapshot(context.Background(), req); status.Code(err) != codes.DataLoss {
 		t.Fatalf("missing metadata FetchSnapshot code = %v, want DataLoss: %v", status.Code(err), err)
@@ -510,7 +510,7 @@ func TestCopySnapshot(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	req := &objectstore.CopySnapshotRequest{
@@ -539,7 +539,7 @@ func TestCopySnapshot(t *testing.T) {
 	badDigest := strings.Repeat("0", sha256.Size*2)
 	store.blobs["tenant/actors/a/snapshots/corrupt/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &badDigest},
+		metadata: map[string]string{integrityMetadata: badDigest},
 	}
 	_, err = server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
 		SrcUri: "azblob://snapshots/actors/a/snapshots/corrupt",
@@ -560,7 +560,7 @@ func TestCopySnapshotKeepsListedSuffix(t *testing.T) {
 	// Blob names are flat, so a listed name may hold a ".." segment.
 	store.blobs["tenant/actors/a/snapshots/one/../victim/file"] = fakeBlob{
 		data:     []byte("payload"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	if _, err := server.CopySnapshot(context.Background(), &objectstore.CopySnapshotRequest{
@@ -624,7 +624,7 @@ func TestCopySnapshotAcrossContainers(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	src.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	server, err := New(map[string]blobstore.Store{"snapshots": src, "tags": dst}, "tenant", t.TempDir())
 	if err != nil {
@@ -657,7 +657,7 @@ func TestStreamingReadErrorsKeepTheirCode(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/manifest.json"] = fakeBlob{
 		data:     []byte("manifest"),
-		metadata: map[string]*string{integrityMetadata: &digest},
+		metadata: map[string]string{integrityMetadata: digest},
 	}
 	store.readErr = fmt.Errorf("%w: connection reset", blobstore.ErrUnavailable)
 	server := newTestServer(t, store, root)
@@ -688,7 +688,7 @@ func TestCopySnapshotPartialRetry(t *testing.T) {
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
-		data: data, metadata: map[string]*string{integrityMetadata: &digest},
+		data: data, metadata: map[string]string{integrityMetadata: digest},
 	}
 	server := newTestServer(t, store, t.TempDir())
 	req := &objectstore.CopySnapshotRequest{SrcUri: testURI, DstUri: "azblob://snapshots/tags/stable"}
@@ -954,7 +954,7 @@ func TestRejectsSymlinksOutsideRoot(t *testing.T) {
 	sum := sha256.Sum256([]byte("replacement"))
 	digest := hex.EncodeToString(sum[:])
 	store.blobs["tenant/actors/a/snapshots/one/memory.img"] = fakeBlob{
-		data: []byte("replacement"), metadata: map[string]*string{integrityMetadata: &digest},
+		data: []byte("replacement"), metadata: map[string]string{integrityMetadata: digest},
 	}
 	if _, err := server.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{
 		SnapshotUri: testURI, WritePath: link, Files: []string{"memory.img"},

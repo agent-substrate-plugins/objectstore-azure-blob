@@ -500,7 +500,7 @@ func (l blockLimits) upload(ctx context.Context, store blobstore.Store, blobName
 	if expectedHash != "" && digest != expectedHash {
 		return fmt.Errorf("%w: source blob got sha256 %s, want %s", errIntegrity, digest, expectedHash)
 	}
-	return store.CommitBlockList(ctx, blobName, blockIDs, map[string]*string{integrityMetadata: &digest})
+	return store.CommitBlockList(ctx, blobName, blockIDs, map[string]string{integrityMetadata: digest})
 }
 
 // uploadVerified commits download, the body of blob srcName in srcStore, as
@@ -593,7 +593,7 @@ func (r *rangeBody) Close() error {
 	return err
 }
 
-func verifyHash(metadata map[string]*string, sum []byte) error {
+func verifyHash(metadata map[string]string, sum []byte) error {
 	want, err := metadataHash(metadata)
 	if err != nil {
 		return err
@@ -605,16 +605,15 @@ func verifyHash(metadata map[string]*string, sum []byte) error {
 	return nil
 }
 
-func metadataHash(metadata map[string]*string) (string, error) {
-	for key, value := range metadata {
-		if strings.EqualFold(key, integrityMetadata) && value != nil {
-			if len(*value) != sha256.Size*2 {
-				return "", fmt.Errorf("%w: blob has invalid SHA-256 metadata", errIntegrity)
-			}
-			return strings.ToLower(*value), nil
-		}
+func metadataHash(metadata map[string]string) (string, error) {
+	value, ok := metadata[integrityMetadata]
+	if !ok {
+		return "", fmt.Errorf("%w: blob has no SHA-256 metadata", errIntegrity)
 	}
-	return "", fmt.Errorf("%w: blob has no SHA-256 metadata", errIntegrity)
+	if len(value) != sha256.Size*2 {
+		return "", fmt.Errorf("%w: blob has invalid SHA-256 metadata", errIntegrity)
+	}
+	return strings.ToLower(value), nil
 }
 
 func (s *Server) validateNodeRequest(snapshotURI, dir string, files []string) (location, string, error) {

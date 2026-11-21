@@ -127,9 +127,10 @@ component alone is therefore a snapshot-only install; see
 `healthcheck` mode takes `--socket` and `--timeout` (default `5s`) and exits
 non-zero unless the plugin at `--socket` reports `SERVING` within the timeout.
 
-The account URL must use `https`. The plugin sends requests, and with them its
-storage token, only to the scheme and host of `--account-url`: it refuses a
-request to any other endpoint and does not follow redirects. Snapshot URIs
+The account URL must use `https` and have no path; a container URL fails
+startup. The plugin sends requests, and with them its storage token, only to
+the scheme and host of `--account-url`: it refuses a request to any other
+endpoint and does not follow redirects. Snapshot URIs
 name only a container and prefix, never a host, so no request can choose
 where the token goes.
 
@@ -292,7 +293,7 @@ Without the gate, ate-api-server ignores that field. See
 | Azure throttling, timeout, or server failure | `Unavailable` |
 | Connection failure, DNS server failure, or DNS timeout after the SDK's retries, or a download that fails after resuming | `Unavailable` |
 | Storage request that makes no progress for one minute (sending, awaiting the response, or one body read), after the SDK's retries | `Unavailable` |
-| Unknown storage account host name | `Internal` |
+| Unknown storage account host name, or a TLS alert such as a failed handshake | `Internal` |
 | Microsoft Entra token request throttled, timed out, failed with a server error, or got no response | `Unavailable` |
 | Microsoft Entra rejects the token request | `Internal` |
 | Blob replaced while a download was resuming | `Unavailable` |

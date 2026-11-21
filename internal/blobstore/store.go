@@ -52,21 +52,32 @@ type Download struct {
 	Body io.ReadCloser
 	// Size is the blob's length in bytes as the service reported it, or
 	// negative if it reported none.
-	Size     int64
-	Metadata map[string]*string
+	Size int64
+	// Metadata is the blob's metadata, with lower-case names.
+	Metadata map[string]string
 }
 
 // Store is the block blob surface used by the snapshot provider.
 type Store interface {
 	// StageBlock stages the bytes of body, at most MaxBlockSize, as one
-	// block whose MD5 is md5. It may seek body back to its start to resend
-	// it, and is done with body when it returns.
+	// uncommitted block of blob name. body must be at its start: the store
+	// may seek it back there to resend it, and is done with it when
+	// StageBlock returns. A block whose bytes do not hash to md5 fails with
+	// ErrUnavailable, since reading the source again may succeed; a nil md5
+	// stages the block unchecked.
 	StageBlock(ctx context.Context, name, blockID string, body io.ReadSeeker, md5 []byte) error
-	CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error
+	// CommitBlockList atomically replaces blob name with the staged blocks
+	// in blockIDs, in that order, and sets its metadata.
+	CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]string) error
+	// Download opens blob name. Reading the body resumes the download after
+	// a dropped connection.
 	Download(ctx context.Context, name string) (Download, error)
 	// DownloadRange opens count bytes of a blob, starting at offset. count
 	// must be positive.
 	DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error)
+	// List returns the name of every blob under prefix.
 	List(ctx context.Context, prefix string) ([]string, error)
+	// Delete removes blob name. An absent blob is already deleted, so
+	// deleting it succeeds.
 	Delete(ctx context.Context, name string) error
 }

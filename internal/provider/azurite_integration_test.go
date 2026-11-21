@@ -280,7 +280,7 @@ func TestAzuriteGRPCEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongDigest := hex.EncodeToString(make([]byte, sha256.Size))
-	if err := azure.CommitBlockList(context.Background(), corruptName, []string{blockID}, map[string]*string{integrityMetadata: &wrongDigest}); err != nil {
+	if err := azure.CommitBlockList(context.Background(), corruptName, []string{blockID}, map[string]string{integrityMetadata: wrongDigest}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := node.FetchSnapshot(context.Background(), &objectstore.FetchSnapshotRequest{

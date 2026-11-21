@@ -41,12 +41,14 @@ import (
 // Azure implements Store with one Azure Blob container.
 type Azure struct {
 	container *container.Client
+	// name is the container's name, for errors.
+	name string
 }
 
 // NewAzure returns a Store for each of containers in the account served at
 // accountURL. The stores share one client, so one connection pool and one
-// token cache. accountURL must use https, and the stores send requests, and
-// with them the credential, only to that scheme and host.
+// token cache. accountURL must use https and have no path, and the stores
+// send requests, and with them the credential, only to that scheme and host.
 func NewAzure(accountURL string, containers []string, credential azcore.TokenCredential) (map[string]Store, error) {
 	return newTokenAzure(accountURL, containers, credential, defaultTransport(), policy.RetryOptions{}, defaultStallTimeout)
 }
@@ -58,6 +60,12 @@ func newTokenAzure(accountURL string, containers []string, credential azcore.Tok
 	}
 	if endpoint.Scheme != "https" {
 		return nil, fmt.Errorf("Azure Blob account URL %q must use https", RedactURL(accountURL))
+	}
+	// The SDK appends the container to the URL's path, so a container URL
+	// would put every blob in that container instead. Only the shared key
+	// constructor accepts a path, for Azurite's path-style account URLs.
+	if endpoint.Path != "" && endpoint.Path != "/" {
+		return nil, fmt.Errorf("Azure Blob account URL %q must not have a path: use https://<account>.blob.core.windows.net, not a container URL", RedactURL(accountURL))
 	}
 	client, err := service.NewClient(accountURL, credential, clientOptions(endpoint, base, retry, stallTimeout))
 	if err != nil {
@@ -78,7 +86,7 @@ func clientOptions(endpoint *url.URL, base http.RoundTripper, retry policy.Retry
 }
 
 func newAzure(client *service.Client, containerName string) *Azure {
-	return &Azure{container: client.NewContainerClient(containerName)}
+	return &Azure{container: client.NewContainerClient(containerName), name: containerName}
 }
 
 func parseConfiguration(accountURL string, containers []string) (*url.URL, error) {
@@ -143,13 +151,17 @@ func (a *Azure) StageBlock(ctx context.Context, name, blockID string, body io.Re
 	_, err := a.blob(name).StageBlock(ctx, blockID, streaming.NopCloser(body), &blockblob.StageBlockOptions{
 		TransactionalValidation: blob.TransferValidationTypeMD5(md5),
 	})
-	return mapError(err)
+	return mapError(err, a.name, name)
 }
 
 // CommitBlockList atomically replaces a blob with the staged block list.
-func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error {
-	_, err := a.blob(name).CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{Metadata: metadata})
-	return mapError(err)
+func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]string) error {
+	sdkMetadata := make(map[string]*string, len(metadata))
+	for key, value := range metadata {
+		sdkMetadata[key] = &value
+	}
+	_, err := a.blob(name).CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{Metadata: sdkMetadata})
+	return mapError(err, a.name, name)
 }
 
 // Download opens a blob and returns the integrity metadata stored with it.
@@ -158,17 +170,30 @@ func (a *Azure) CommitBlockList(ctx context.Context, name string, blockIDs []str
 func (a *Azure) Download(ctx context.Context, name string) (Download, error) {
 	resp, err := a.blob(name).DownloadStream(ctx, nil)
 	if err != nil {
-		return Download{}, mapError(err)
+		return Download{}, mapError(err, a.name, name)
 	}
 	size := int64(-1)
 	if resp.ContentLength != nil {
 		size = *resp.ContentLength
 	}
 	return Download{
-		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
+		Body:     mappedBody{ReadCloser: resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3}), container: a.name, blob: name},
 		Size:     size,
-		Metadata: resp.Metadata,
+		Metadata: lowerKeys(resp.Metadata),
 	}, nil
+}
+
+// lowerKeys returns metadata with lower-case names. Azure matches metadata
+// names without regard to case, and the SDK returns them as net/http
+// canonicalized the headers that carried them, such as Substrate_sha256.
+func lowerKeys(metadata map[string]*string) map[string]string {
+	lowered := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if value != nil {
+			lowered[strings.ToLower(key)] = *value
+		}
+	}
+	return lowered
 }
 
 // DownloadRange opens count bytes of a blob from offset. Like Download, its
@@ -180,9 +205,9 @@ func (a *Azure) DownloadRange(ctx context.Context, name string, offset, count in
 	}
 	resp, err := a.blob(name).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: offset, Count: count}})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, mapError(err, a.name, name)
 	}
-	return mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})}, nil
+	return mappedBody{ReadCloser: resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3}), container: a.name, blob: name}, nil
 }
 
 // List returns every blob name under prefix.
@@ -192,7 +217,7 @@ func (a *Azure) List(ctx context.Context, prefix string) ([]string, error) {
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, mapError(err)
+			return nil, mapError(err, a.name, "")
 		}
 		for _, item := range page.Segment.BlobItems {
 			if item.Name != nil {
@@ -206,7 +231,7 @@ func (a *Azure) List(ctx context.Context, prefix string) ([]string, error) {
 // Delete removes one blob. An absent blob is already deleted.
 func (a *Azure) Delete(ctx context.Context, name string) error {
 	_, err := a.blob(name).Delete(ctx, nil)
-	err = mapError(err)
+	err = mapError(err, a.name, name)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -216,6 +241,7 @@ func (a *Azure) Delete(ctx context.Context, name string) error {
 // mappedBody maps errors from a download body the same way as request errors.
 type mappedBody struct {
 	io.ReadCloser
+	container, blob string
 }
 
 func (b mappedBody) Read(p []byte) (int, error) {
@@ -223,10 +249,12 @@ func (b mappedBody) Read(p []byte) (int, error) {
 	if err == nil || err == io.EOF {
 		return n, err
 	}
-	return n, mapError(err)
+	return n, mapError(err, b.container, b.blob)
 }
 
-func mapError(err error) error {
+// mapError maps err from a request for blob, or for container itself if blob
+// is empty, to the store's errors.
+func mapError(err error, container, blob string) error {
 	if err == nil {
 		return nil
 	}
@@ -243,9 +271,9 @@ func mapError(err error) error {
 	}
 	switch responseErr.ErrorCode {
 	case "BlobNotFound":
-		return fmt.Errorf("%w: %s", ErrNotFound, responseErr.ErrorCode)
+		return fmt.Errorf("%w: %q in container %q", ErrNotFound, blob, container)
 	case "ContainerNotFound":
-		return fmt.Errorf("%w: configured Azure Blob container does not exist", ErrContainerNotFound)
+		return fmt.Errorf("%w: configured Azure Blob container %q does not exist", ErrContainerNotFound, container)
 	case "ConditionNotMet":
 		// A resumed download found the blob replaced since it was opened.
 		// Retrying the operation reads the new blob from the start.
@@ -291,7 +319,7 @@ func mapAuthenticationError(err error, authErr *azidentity.AuthenticationFailedE
 // not hit: the SDK has already retried the request, or the download resumed,
 // as many times as it allows. A request the endpoint check refused and an
 // expired or canceled context are not transient, and neither is a host name
-// that does not exist.
+// that does not exist or a TLS alert, such as a failed handshake.
 func transient(err error) bool {
 	var foreign *foreignEndpointError
 	if errors.As(err, &foreign) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -303,7 +331,14 @@ func transient(err error) bool {
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		return true
+		switch opErr.Op {
+		case "dial", "read", "write":
+			return true
+		case "proxyconnect":
+			// net/http wraps any failure to reach the storage endpoint
+			// through a proxy, including a TLS alert, in this op.
+			return transient(opErr.Err)
+		}
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {

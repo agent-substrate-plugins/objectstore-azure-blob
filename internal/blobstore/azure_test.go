@@ -18,11 +18,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -175,7 +177,7 @@ func TestAzureStore(t *testing.T) {
 	if err := store.StageBlock(ctx, "prefix/file", blockID, bytes.NewReader(data), sum[:]); err != nil {
 		t.Fatalf("StageBlock: %v", err)
 	}
-	if err := store.CommitBlockList(ctx, "prefix/file", []string{blockID}, map[string]*string{"substrate_sha256": &digest}); err != nil {
+	if err := store.CommitBlockList(ctx, "prefix/file", []string{blockID}, map[string]string{"substrate_sha256": digest}); err != nil {
 		t.Fatalf("CommitBlockList: %v", err)
 	}
 	download, err := store.Download(ctx, "prefix/file")
@@ -195,7 +197,7 @@ func TestAzureStore(t *testing.T) {
 	if download.Size != int64(len(data)) {
 		t.Fatalf("download size = %d, want %d", download.Size, len(data))
 	}
-	if value := download.Metadata["Substrate_sha256"]; value == nil || *value != digest {
+	if value := download.Metadata["substrate_sha256"]; value != digest {
 		t.Fatalf("metadata = %v, want digest %q", download.Metadata, digest)
 	}
 	ranged, err := store.DownloadRange(ctx, "prefix/file", 2, 4)
@@ -231,8 +233,8 @@ func TestAzureStore(t *testing.T) {
 	if err := store.Delete(ctx, "prefix/file"); err != nil {
 		t.Fatalf("idempotent Delete: %v", err)
 	}
-	if _, err := store.Download(ctx, "prefix/file"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing Download = %v, want ErrNotFound", err)
+	if _, err := store.Download(ctx, "prefix/file"); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), `"prefix/file" in container "snapshots"`) {
+		t.Fatalf("missing Download = %v, want ErrNotFound naming the blob and container", err)
 	}
 }
 
@@ -311,10 +313,10 @@ func TestRedactURL(t *testing.T) {
 
 func TestMapError(t *testing.T) {
 	sentinel := errors.New("plain")
-	if got := mapError(nil); got != nil {
+	if got := mapError(nil, "snapshots", "prefix/file"); got != nil {
 		t.Fatalf("mapError(nil) = %v", got)
 	}
-	if got := mapError(sentinel); !errors.Is(got, sentinel) {
+	if got := mapError(sentinel, "snapshots", "prefix/file"); !errors.Is(got, sentinel) {
 		t.Fatalf("mapError(plain) = %v", got)
 	}
 	for _, tc := range []struct {
@@ -322,9 +324,10 @@ func TestMapError(t *testing.T) {
 		statusCode int
 		errorCode  string
 		want       error
+		message    string
 	}{
-		{name: "blob missing", statusCode: http.StatusNotFound, errorCode: "BlobNotFound", want: ErrNotFound},
-		{name: "container missing", statusCode: http.StatusNotFound, errorCode: "ContainerNotFound", want: ErrContainerNotFound},
+		{name: "blob missing", statusCode: http.StatusNotFound, errorCode: "BlobNotFound", want: ErrNotFound, message: `blob not found: "prefix/file" in container "snapshots"`},
+		{name: "container missing", statusCode: http.StatusNotFound, errorCode: "ContainerNotFound", want: ErrContainerNotFound, message: `blob container not found: configured Azure Blob container "snapshots" does not exist`},
 		{name: "authentication", statusCode: http.StatusForbidden, errorCode: "AuthenticationFailed", want: ErrPermission},
 		{name: "authorization", statusCode: http.StatusForbidden, errorCode: "AuthorizationPermissionMismatch", want: ErrPermission},
 		{name: "other forbidden", statusCode: http.StatusForbidden, errorCode: "AuthorizationServiceMismatch", want: ErrPermission},
@@ -336,13 +339,17 @@ func TestMapError(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := &azcore.ResponseError{StatusCode: tc.statusCode, ErrorCode: tc.errorCode}
-			if got := mapError(err); !errors.Is(got, tc.want) {
+			got := mapError(err, "snapshots", "prefix/file")
+			if !errors.Is(got, tc.want) {
 				t.Fatalf("mapError = %v, want %v", got, tc.want)
+			}
+			if tc.message != "" && got.Error() != tc.message {
+				t.Fatalf("mapError = %q, want %q", got, tc.message)
 			}
 		})
 	}
 	other := &azcore.ResponseError{StatusCode: http.StatusBadRequest, ErrorCode: "InvalidRequest", RawResponse: &http.Response{Request: &http.Request{URL: &url.URL{}}}}
-	if got := mapError(other); got != other {
+	if got := mapError(other, "snapshots", "prefix/file"); got != other {
 		t.Fatalf("mapError(other) = %v, want original", got)
 	}
 }
@@ -360,13 +367,18 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		{name: "truncated body", err: io.ErrUnexpectedEOF, transient: true},
 		{name: "connection closed before response", err: &url.Error{Op: "Get", URL: "https://a", Err: io.EOF}, transient: true},
 		{name: "TLS handshake timeout", err: timeoutError{}, transient: true},
+		{name: "proxy refused", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}}, transient: true},
+		{name: "write to a closed connection", err: &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}, transient: true},
 		{name: "unknown host", err: &net.DNSError{Err: "no such host", Name: "a", IsNotFound: true}},
+		{name: "TLS alert", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "remote error", Err: tlsAlert("handshake failure")}}},
+		{name: "TLS alert through a proxy", err: &url.Error{Op: "Get", URL: "https://a", Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.OpError{Op: "remote error", Err: tlsAlert("handshake failure")}}}},
+		{name: "local TLS alert", err: &net.OpError{Op: "local error", Err: tlsAlert("protocol version not supported")}},
 		{name: "foreign endpoint", err: &foreignEndpointError{scheme: "https", host: "other", want: "https://a"}},
 		{name: "canceled", err: &url.Error{Op: "Get", URL: "https://a", Err: context.Canceled}},
 		{name: "deadline", err: &url.Error{Op: "Get", URL: "https://a", Err: context.DeadlineExceeded}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mapError(tc.err)
+			got := mapError(tc.err, "snapshots", "prefix/file")
 			if errors.Is(got, ErrUnavailable) != tc.transient {
 				t.Fatalf("mapError(%v) = %v, want ErrUnavailable: %v", tc.err, got, tc.transient)
 			}
@@ -376,10 +388,16 @@ func TestMapErrorTransportFailures(t *testing.T) {
 		})
 	}
 	changed := &azcore.ResponseError{StatusCode: http.StatusPreconditionFailed, ErrorCode: "ConditionNotMet"}
-	if got := mapError(changed); !errors.Is(got, ErrUnavailable) {
+	if got := mapError(changed, "snapshots", "prefix/file"); !errors.Is(got, ErrUnavailable) {
 		t.Fatalf("mapError(ConditionNotMet) = %v, want ErrUnavailable", got)
 	}
 }
+
+// tlsAlert stands in for crypto/tls's unexported alert type, which reports
+// itself as neither a timeout nor temporary.
+type tlsAlert string
+
+func (a tlsAlert) Error() string { return "tls: " + string(a) }
 
 type timeoutError struct{}
 
@@ -403,6 +421,26 @@ func TestAzureConnectionFailureIsUnavailable(t *testing.T) {
 	}
 	if err := store.StageBlock(ctx, "prefix/file", "YmxvY2s=", strings.NewReader("x"), nil); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("StageBlock = %v, want ErrUnavailable", err)
+	}
+}
+
+// TestAzureTLSAlertIsNotUnavailable runs against an endpoint that ends every
+// handshake with a TLS alert, which a later attempt would hit again.
+func TestAzureTLSAlertIsNotUnavailable(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.NotFoundHandler())
+	server.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	defer server.Close()
+
+	store := newTokenStore(t, server.URL, staticCredential{}, server.Client().Transport, policy.RetryOptions{MaxRetries: -1})
+	err := store.Delete(t.Context(), "prefix/file")
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "remote error" {
+		t.Fatalf("Delete = %v, want a TLS alert", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Delete = %v, want a TLS alert not to be ErrUnavailable", err)
 	}
 }
 
